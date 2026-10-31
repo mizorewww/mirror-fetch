@@ -1,0 +1,22 @@
+name: Release PR
+# Run by hand: opens a pull request with the next version and changelog, and tags
+# what has been merged. It needs "Allow GitHub Actions to create pull requests" in
+# the repository settings. Nothing goes to crates.io.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-plz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
