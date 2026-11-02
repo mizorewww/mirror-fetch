@@ -177,7 +177,7 @@ mod lookup {
             let sender = sender.clone();
             std::thread::spawn(move || {
                 let agent = ureq::Agent::config_builder()
-                    .proxy(None)
+                    .proxy(crate::proxy::Route::from_environment().proxy())
                     .timeout_global(Some(DEADLINE))
                     .build()
                     .new_agent();

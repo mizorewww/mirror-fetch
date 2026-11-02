@@ -7,9 +7,13 @@ Resumable, verified downloads of model files from Hugging Face and its mirrors.
 - **Falls through**: each host is tried in order; a stalled host is dropped within a minute.
 - **Uses aria2 if you say so**: pass its path for parallel connections; if it can't
   run, the built-in client takes over.
+- **Follows the proxy**: `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` (and lower-case
+  forms), with `NO_PROXY`. `localhost`, `127.0.0.1` and `::1` always go direct. aria2
+  is given the same route; it speaks only to HTTP proxies, so with a SOCKS or HTTPS
+  proxy the built-in client takes over.
 - **Leaves policy to you**: hosts, aria2's location, cancellation and progress are all
-  passed in. It reads no environment variable of its own and has no user-facing text:
-  events and errors are typed.
+  passed in. Beyond the proxy variables it reads no environment variable of its own
+  and has no user-facing text: events and errors are typed.
 
 ```toml
 [dependencies]

@@ -24,10 +24,9 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         let _ = fs::remove_file(t.part);
         let _ = fs::remove_file(control);
     }
-    // Hosts hand large files to a CDN, so downloads follow redirects. Proxy settings
-    // in the environment are ignored: they would also catch local services.
+    // Hosts hand large files to a CDN, so downloads follow redirects.
     let agent = ureq::Agent::config_builder()
-        .proxy(None)
+        .proxy(t.route.proxy())
         .max_redirects(5)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_per_read(Some(STALL))
@@ -163,6 +162,7 @@ mod tests {
     use crate::download::Remote;
     use crate::download::test_support::{serve, sha256};
     use crate::hub::Host;
+    use crate::proxy::DIRECT;
 
     fn transfer<'a>(
         url: &'a str,
@@ -177,6 +177,7 @@ mod tests {
             remote,
             cancel: &(),
             progress: &(),
+            route: &DIRECT,
         }
     }
 

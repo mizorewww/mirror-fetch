@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Failure, HostFailure, Stop};
 use crate::hub::Host;
+use crate::proxy::Route;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,7 @@ pub struct Downloader {
     hosts: Vec<Host>,
     aria2: Option<PathBuf>,
     aria2_broken: AtomicBool,
+    route: Route,
 }
 
 /// What one transfer attempt needs.
@@ -111,6 +113,7 @@ pub(crate) struct Transfer<'a> {
     pub remote: &'a Remote<'a>,
     pub cancel: &'a dyn Cancel,
     pub progress: &'a dyn Progress,
+    pub route: &'a Route,
 }
 
 impl Transfer<'_> {
@@ -132,12 +135,23 @@ impl Transfer<'_> {
 
 impl Downloader {
     /// `hosts` are tried in order. `aria2` is the program's path, if it should be used.
+    ///
+    /// Requests go through the proxy that `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY`
+    /// names, as they stand now, except to the hosts `NO_PROXY` lists and to this
+    /// machine's own (`localhost`, `127.0.0.1`, `::1`).
     pub fn new(hosts: Vec<Host>, aria2: Option<PathBuf>) -> Self {
         Self {
             hosts,
             aria2,
             aria2_broken: AtomicBool::new(false),
+            route: Route::from_environment(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn routed(mut self, route: Route) -> Self {
+        self.route = route;
+        self
     }
 
     /// Downloads `remote` to `dest`, resuming from `dest` with the extension `.part`.
@@ -167,6 +181,7 @@ impl Downloader {
                 remote,
                 cancel,
                 progress,
+                route: &self.route,
             };
             let failure = match self.transfer(&transfer) {
                 Ok(()) => match verify(&part, remote, cancel, progress) {
@@ -319,6 +334,43 @@ pub(crate) mod test_support {
         (format!("http://{address}"), server)
     }
 
+    /// A CONNECT proxy on loopback: each connection asks for a tunnel, then sends one
+    /// request inside it, answered with the next canned response. Returns the proxy's
+    /// URL and a handle yielding each CONNECT head and inner request head.
+    pub fn serve_proxy(
+        responses: Vec<String>,
+    ) -> (String, std::thread::JoinHandle<Vec<(String, String)>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let connect = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .unwrap();
+                let request = read_head(&mut stream);
+                stream.write_all(response.as_bytes()).unwrap();
+                heads.push((connect, request));
+            }
+            heads
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn read_head(stream: &mut std::net::TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut byte = [0u8; 1];
+        while !data.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+            data.push(byte[0]);
+        }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
     pub fn sha256(body: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         Sha256::digest(body)
@@ -420,6 +472,46 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!dest.exists());
+    }
+
+    /// A remote host is reached through the environment's proxy; a loopback host
+    /// beside it is not, even with that proxy unreachable.
+    #[test]
+    fn remote_hosts_go_through_the_proxy_and_loopback_does_not() {
+        use super::test_support::serve_proxy;
+        let hash = sha256(b"12345");
+        let remote = Remote {
+            repo: "test/repo",
+            file: "synthetic.bin",
+            size: 5,
+            sha256: &hash,
+        };
+        let (proxy, server) = serve_proxy(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
+        ]);
+        let route = Route::new(Some(ureq::Proxy::new(&proxy).unwrap()), None);
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("proxied.bin");
+        Downloader::new(vec![Host::Hub("http://models.invalid".into())], None)
+            .routed(route)
+            .fetch(&remote, &dest, &(), &())
+            .unwrap();
+        let heads = server.join().unwrap();
+        assert!(heads[0].0.starts_with("CONNECT models.invalid:80 "));
+        assert!(heads[0].1.contains("/test/repo/resolve/main/synthetic.bin"));
+        assert_eq!(fs::read(&dest).unwrap(), b"12345");
+
+        let (base, server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
+        ]);
+        let unreachable = Route::new(Some(ureq::Proxy::new("http://127.0.0.1:1").unwrap()), None);
+        let dest = root.path().join("direct.bin");
+        Downloader::new(vec![Host::Hub(base)], None)
+            .routed(unreachable)
+            .fetch(&remote, &dest, &(), &())
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"12345");
     }
 
     #[test]
