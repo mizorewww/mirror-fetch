@@ -68,10 +68,22 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     let gid = random_hex(8)?;
     // The secret stays out of the process list; the file also replaces any
     // user aria2.conf, whose options could change where bytes land.
+    // So do the proxy and its credentials, routed as the built-in client routes them;
+    // aria2's own reading of the environment is cleared below.
+    let proxy = t
+        .route
+        .aria2_options(t.url)
+        .map_err(|reason| unavailable(&reason))?;
     let mut conf = tempfile::NamedTempFile::new()?;
     writeln!(conf, "rpc-secret={secret}")?;
+    for line in proxy {
+        writeln!(conf, "{line}")?;
+    }
     conf.flush()?;
     let mut command = Command::new(program);
+    for name in crate::proxy::ARIA2_ENVIRONMENT {
+        command.env_remove(name);
+    }
     command
         .arg(format!("--conf-path={}", conf.path().display()))
         .arg("--quiet=true")
@@ -110,6 +122,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             .and_then(|lines| lines.lock().ok().map(|lines| lines.join("\n")))
             .unwrap_or_default()
     };
+    // aria2's RPC listens on loopback, which never goes through a proxy.
     let rpc = ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
@@ -220,6 +233,7 @@ mod tests {
     use crate::download::Remote;
     use crate::hub::Host;
     use crate::native::aria2_control;
+    use crate::proxy::{DIRECT, Route};
 
     #[test]
     fn a_missing_program_is_unavailable_not_a_failed_transfer() {
@@ -239,6 +253,7 @@ mod tests {
             remote: &remote,
             cancel: &(),
             progress: &(),
+            route: &DIRECT,
         };
         assert!(matches!(
             run(&root.path().join("no-such-aria2c"), &transfer),
@@ -294,9 +309,52 @@ mod tests {
             remote: &remote,
             cancel: &(),
             progress: &last,
+            route: &DIRECT,
         };
         run(program, &transfer).unwrap();
         assert_eq!(std::fs::read(&part).unwrap(), b"12345");
         assert_eq!(*last.0.lock().unwrap(), 5);
+    }
+
+    /// Only where aria2c is installed: aria2 goes through the same proxy, as a plain
+    /// HTTP proxy for an `http://` file.
+    #[test]
+    fn a_real_aria2_uses_the_proxy() {
+        use crate::download::test_support::{serve, sha256};
+        let program = Path::new("aria2c");
+        if Command::new(program).arg("--version").output().is_err() {
+            return;
+        }
+        let hash = sha256(b"12345");
+        let remote = Remote {
+            repo: "r",
+            file: "f",
+            size: 5,
+            sha256: &hash,
+        };
+        let (proxy, server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
+        ]);
+        let route = Route::new(Some(ureq::Proxy::new(&proxy).unwrap()), None);
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("file.part");
+        let host = Host::Hub("http://models.invalid".into());
+        let transfer = Transfer {
+            url: "http://models.invalid/r/resolve/main/f",
+            host: &host,
+            part: &part,
+            remote: &remote,
+            cancel: &(),
+            progress: &(),
+            route: &route,
+        };
+        run(program, &transfer).unwrap();
+        let heads = server.join().unwrap();
+        assert!(
+            heads[0].starts_with("GET http://models.invalid/r/resolve/main/f "),
+            "{}",
+            heads[0]
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"12345");
     }
 }
