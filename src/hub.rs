@@ -18,20 +18,25 @@ pub enum Host {
     /// A Hub-compatible base URL: the origin, the mirror or a configured endpoint.
     Hub(String),
     ModelScope,
+    /// One file's own URL, for a [`Mirror`](crate::Mirror) outside any hub.
+    Url(String),
 }
 
 impl Host {
+    /// The file at revision `main` (ModelScope's `master`). A [`Host::Url`] is
+    /// already the file.
     pub fn file_url(&self, repo: &str, file: &str) -> String {
         match self {
             Self::Hub(base) => format!("{base}/{repo}/resolve/main/{file}"),
             Self::ModelScope => format!("{MODELSCOPE}/models/{repo}/resolve/master/{file}"),
+            Self::Url(url) => url.clone(),
         }
     }
 
     /// `huggingface.co`, `hf-mirror.com`, `modelscope.cn`: for progress and messages.
     pub fn name(&self) -> String {
         match self {
-            Self::Hub(base) => host_name(base),
+            Self::Hub(base) | Self::Url(base) => host_name(base),
             Self::ModelScope => host_name(MODELSCOPE),
         }
     }

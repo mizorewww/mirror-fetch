@@ -1,8 +1,9 @@
-//! One file, across hosts: transfer, verify, then replace.
+//! One file, across mirrors: transfer, verify, then replace.
 
 use crate::error::{Error, Failure, HostFailure, Stop};
 use crate::hub::Host;
 use crate::proxy::Route;
+use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,13 +13,119 @@ use std::time::Duration;
 /// A host that sends nothing for this long is treated as stalled.
 pub(crate) const STALL: Duration = Duration::from_secs(60);
 
+/// How many connections aria2 opens to one server unless told otherwise.
+pub const DEFAULT_CONNECTIONS: u32 = 8;
+
+/// The most connections aria2 accepts per server.
+pub const MAX_CONNECTIONS: u32 = 16;
+
 /// A file published in a model repository, with its size and SHA-256.
+///
+/// [`Downloader::fetch`] takes it with the downloader's hosts, at revision `main`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Remote<'a> {
     pub repo: &'a str,
     pub file: &'a str,
     pub size: u64,
     pub sha256: &'a str,
+}
+
+/// One URL that serves a file, and the [`Host`] that events name for it.
+///
+/// A mirror may carry a bearer token. It is sent only with requests to this
+/// mirror's URL, never after a redirect, and never handed to aria2: a mirror with a
+/// token always uses the built-in client. `Debug` does not show it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Mirror {
+    host: Host,
+    url: String,
+    bearer: Option<String>,
+}
+
+impl Mirror {
+    /// Any HTTP(S) URL; events name it [`Host::Url`].
+    pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
+        Self {
+            host: Host::Url(url.clone()),
+            url,
+            bearer: None,
+        }
+    }
+
+    /// `url`, reported as `host`: how [`Downloader::fetch`] names its hosts.
+    pub fn on(host: Host, url: impl Into<String>) -> Self {
+        Self {
+            host,
+            url: url.into(),
+            bearer: None,
+        }
+    }
+
+    /// Sends `Authorization: Bearer <token>` to this mirror. Blank means none.
+    pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.bearer = (!token.trim().is_empty()).then(|| token.trim().to_owned());
+        self
+    }
+
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Whether requests to this mirror carry a token.
+    pub fn has_bearer(&self) -> bool {
+        self.bearer.is_some()
+    }
+}
+
+impl fmt::Debug for Mirror {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mirror")
+            .field("host", &self.host)
+            .field("url", &self.url)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// One file to download: the mirrors that serve it, tried in order, and what it
+/// must be. Without `size` the server's length is trusted; without `sha256` the
+/// bytes are not checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Target {
+    pub mirrors: Vec<Mirror>,
+    pub size: Option<u64>,
+    /// Lower-case hex; [`Target::with_sha256`] lower-cases it.
+    pub sha256: Option<String>,
+}
+
+impl Target {
+    /// The same file at each of `urls`, in order.
+    pub fn new<I, U>(urls: I) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Into<String>,
+    {
+        Self {
+            mirrors: urls.into_iter().map(Mirror::new).collect(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    pub fn with_sha256(mut self, hex: impl AsRef<str>) -> Self {
+        self.sha256 = Some(hex.as_ref().trim().to_ascii_lowercase());
+        self
+    }
 }
 
 /// Polled at safe points; true stops the download with [`Error::Cancelled`]. What was
@@ -41,9 +148,15 @@ impl Cancel for () {
 }
 
 /// Receives each [`Event`] on the thread that called
-/// [`Downloader::fetch`](crate::Downloader::fetch).
+/// [`Downloader::download`] or [`Downloader::fetch`].
 pub trait Progress {
     fn event(&self, event: Event<'_>);
+
+    /// The total that [`Event::Position`] counts toward in the current phase, once
+    /// it is known: the expected size, or the server's, while downloading; the
+    /// file's length while verifying. Without an expected size or a length from
+    /// the server, it never comes.
+    fn length(&self, _bytes: u64) {}
 }
 
 /// Ignores everything.
@@ -101,6 +214,7 @@ pub enum Event<'a> {
 pub struct Downloader {
     hosts: Vec<Host>,
     aria2: Option<PathBuf>,
+    connections: u32,
     aria2_broken: AtomicBool,
     route: Route,
 }
@@ -110,7 +224,10 @@ pub(crate) struct Transfer<'a> {
     pub url: &'a str,
     pub host: &'a Host,
     pub part: &'a Path,
-    pub remote: &'a Remote<'a>,
+    /// The expected length, if known.
+    pub size: Option<u64>,
+    pub bearer: Option<&'a str>,
+    pub connections: u32,
     pub cancel: &'a dyn Cancel,
     pub progress: &'a dyn Progress,
     pub route: &'a Route,
@@ -133,8 +250,17 @@ impl Transfer<'_> {
     }
 }
 
+/// No hosts and no aria2: enough for [`Downloader::download`], whose
+/// [`Target`] names its own mirrors.
+impl Default for Downloader {
+    fn default() -> Self {
+        Self::new(Vec::new(), None)
+    }
+}
+
 impl Downloader {
-    /// `hosts` are tried in order. `aria2` is the program's path, if it should be used.
+    /// `hosts` are tried in order by [`Downloader::fetch`]; [`Downloader::download`]
+    /// ignores them. `aria2` is the program's path, if it should be used.
     ///
     /// Requests go through the proxy that `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY`
     /// names, as they stand now, except to the hosts `NO_PROXY` lists and to this
@@ -143,9 +269,29 @@ impl Downloader {
         Self {
             hosts,
             aria2,
+            connections: DEFAULT_CONNECTIONS,
             aria2_broken: AtomicBool::new(false),
             route: Route::from_environment(),
         }
+    }
+
+    /// Uses aria2 at `program`, or not at all with `None`.
+    pub fn with_aria2(mut self, program: Option<PathBuf>) -> Self {
+        self.aria2 = program;
+        self.aria2_broken = AtomicBool::new(false);
+        self
+    }
+
+    /// How many connections aria2 opens to one server, from 1 to
+    /// [`MAX_CONNECTIONS`]. The built-in client always uses one.
+    pub fn with_connections(mut self, connections: u32) -> Self {
+        self.connections = connections.clamp(1, MAX_CONNECTIONS);
+        self
+    }
+
+    /// The hosts [`Downloader::fetch`] tries.
+    pub fn hosts(&self) -> &[Host] {
+        &self.hosts
     }
 
     #[cfg(test)]
@@ -154,9 +300,35 @@ impl Downloader {
         self
     }
 
-    /// Downloads `remote` to `dest`, resuming from `dest` with the extension `.part`.
-    /// Writes `dest` with the extension `manifest.json` afterwards, recording the
-    /// verified size and hash.
+    /// Downloads `target` to `dest`, resuming from `dest` with `.part` appended
+    /// (`model.gguf.part`). Each mirror is tried in turn; one whose bytes fail
+    /// the size or SHA-256 is given up on and its bytes discarded. `dest` is
+    /// replaced only by a complete, verified file. Its directory is created.
+    pub fn download(
+        &self,
+        target: &Target,
+        dest: &Path,
+        cancel: &dyn Cancel,
+        progress: &dyn Progress,
+    ) -> Result<(), Error> {
+        let expect = Expect {
+            size: target.size,
+            sha256: target.sha256.as_deref(),
+        };
+        self.run(
+            &target.mirrors,
+            expect,
+            dest,
+            &part_path(dest),
+            cancel,
+            progress,
+            &|| {},
+        )
+    }
+
+    /// Downloads `remote` from this downloader's hosts to `dest`, resuming from
+    /// `dest` with the extension `.part`. Writes `dest` with the extension
+    /// `manifest.json` afterwards, recording the verified size and hash.
     pub fn fetch(
         &self,
         remote: &Remote<'_>,
@@ -164,35 +336,67 @@ impl Downloader {
         cancel: &dyn Cancel,
         progress: &dyn Progress,
     ) -> Result<(), Error> {
-        if let Some(parent) = dest.parent() {
+        let mirrors: Vec<Mirror> = self
+            .hosts
+            .iter()
+            .map(|host| Mirror::on(host.clone(), host.file_url(remote.repo, remote.file)))
+            .collect();
+        let expect = Expect {
+            size: Some(remote.size),
+            sha256: Some(remote.sha256),
+        };
+        self.run(
+            &mirrors,
+            expect,
+            dest,
+            &dest.with_extension("part"),
+            cancel,
+            progress,
+            &|| write_manifest(dest, remote, progress),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        mirrors: &[Mirror],
+        expect: Expect<'_>,
+        dest: &Path,
+        part: &Path,
+        cancel: &dyn Cancel,
+        progress: &dyn Progress,
+        placed: &dyn Fn(),
+    ) -> Result<(), Error> {
+        if let Some(parent) = dest.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
-        let part = dest.with_extension("part");
         let mut failures = Vec::new();
-        for host in &self.hosts {
+        for mirror in mirrors {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let url = host.file_url(remote.repo, remote.file);
+            let host = &mirror.host;
             let transfer = Transfer {
-                url: &url,
+                url: &mirror.url,
                 host,
-                part: &part,
-                remote,
+                part,
+                size: expect.size,
+                bearer: mirror.bearer.as_deref(),
+                connections: self.connections,
                 cancel,
                 progress,
                 route: &self.route,
             };
             let failure = match self.transfer(&transfer) {
-                Ok(()) => match verify(&part, remote, cancel, progress) {
+                Ok(()) => match verify(part, expect, cancel, progress) {
                     Ok(true) => {
-                        fs::rename(&part, dest).map_err(Error::Io)?;
-                        write_manifest(dest, remote, progress);
+                        fs::rename(part, dest).map_err(Error::Io)?;
+                        placed();
                         progress.event(Event::Completed { host });
                         return Ok(());
                     }
                     Ok(false) => {
-                        let _ = fs::remove_file(&part);
+                        let _ = fs::remove_file(part);
                         failures.push(HostFailure {
                             host: host.name(),
                             failure: Failure::ChecksumMismatch,
@@ -221,9 +425,11 @@ impl Downloader {
     }
 
     fn transfer(&self, transfer: &Transfer) -> Result<(), Stop> {
+        // A token never leaves the built-in client, which drops it on redirects.
         let program = self
             .aria2
             .as_deref()
+            .filter(|_| transfer.bearer.is_none())
             .filter(|_| !self.aria2_broken.load(Ordering::Relaxed));
         if let Some(program) = program {
             match crate::aria2::run(program, transfer) {
@@ -240,23 +446,45 @@ impl Downloader {
     }
 }
 
-/// Whether `part` has the published size and SHA-256; reports hashing progress.
-pub(crate) fn verify(
-    part: &Path,
-    remote: &Remote<'_>,
+/// What the bytes must be.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Expect<'a> {
+    pub size: Option<u64>,
+    pub sha256: Option<&'a str>,
+}
+
+/// `dest` with `.part` appended, so `a.tar.gz` and `a.zip` do not share one.
+pub fn part_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// The lower-case hex SHA-256 of the file at `path`, reporting
+/// [`Phase::Verify`] progress.
+pub fn file_sha256(
+    path: &Path,
     cancel: &dyn Cancel,
     progress: &dyn Progress,
-) -> Result<bool, Stop> {
-    use sha2::{Digest, Sha256};
-    if fs::metadata(part).map(|m| m.len()).unwrap_or(0) != remote.size {
-        return Ok(false);
+) -> Result<String, Error> {
+    match hash_file(path, cancel, progress) {
+        Ok(digest) => Ok(digest),
+        Err(Stop::Failed(Failure::Io(error))) => Err(Error::Io(error)),
+        Err(_) => Err(Error::Cancelled),
     }
+}
+
+fn hash_file(path: &Path, cancel: &dyn Cancel, progress: &dyn Progress) -> Result<String, Stop> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
     progress.event(Event::Phase {
         phase: Phase::Verify,
         host: None,
     });
+    if let Ok(metadata) = file.metadata() {
+        progress.length(metadata.len());
+    }
     progress.event(Event::Position { bytes: 0 });
-    let mut file = fs::File::open(part)?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut done = 0u64;
@@ -272,14 +500,34 @@ pub(crate) fn verify(
         done += n as u64;
         progress.event(Event::Position { bytes: done });
     }
-    let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if digest != remote.sha256 {
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether `part` has the expected size and SHA-256, where they are known;
+/// reports hashing progress.
+pub(crate) fn verify(
+    part: &Path,
+    expect: Expect<'_>,
+    cancel: &dyn Cancel,
+    progress: &dyn Progress,
+) -> Result<bool, Stop> {
+    if let Some(size) = expect.size
+        && fs::metadata(part).map(|m| m.len()).unwrap_or(0) != size
+    {
+        return Ok(false);
+    }
+    let Some(expected) = expect.sha256 else {
+        return Ok(true);
+    };
+    let digest = hash_file(part, cancel, progress)?;
+    let matches = digest.eq_ignore_ascii_case(expected.trim());
+    if !matches {
         progress.event(Event::ChecksumMismatch {
-            expected: remote.sha256,
+            expected,
             actual: &digest,
         });
     }
-    Ok(digest == remote.sha256)
+    Ok(matches)
 }
 
 /// Records the verified size so a later start can trust the file without hashing it.
@@ -406,12 +654,28 @@ mod tests {
         };
         let root = tempfile::tempdir().unwrap();
         let part = root.path().join("synthetic.part");
+        let expect = Expect {
+            size: Some(remote.size),
+            sha256: Some(remote.sha256),
+        };
         fs::write(&part, b"12346").unwrap();
-        assert!(!verify(&part, &remote, &(), &()).unwrap());
+        assert!(!verify(&part, expect, &(), &()).unwrap());
         fs::write(&part, b"1234").unwrap();
-        assert!(!verify(&part, &remote, &(), &()).unwrap());
+        assert!(!verify(&part, expect, &(), &()).unwrap());
         fs::write(&part, b"12345").unwrap();
-        assert!(verify(&part, &remote, &(), &()).unwrap());
+        assert!(verify(&part, expect, &(), &()).unwrap());
+        let upper = hash.to_ascii_uppercase();
+        let only_hash = Expect {
+            size: None,
+            sha256: Some(&upper),
+        };
+        assert!(verify(&part, only_hash, &(), &()).unwrap());
+        let nothing = Expect {
+            size: None,
+            sha256: None,
+        };
+        fs::write(&part, b"anything").unwrap();
+        assert!(verify(&part, nothing, &(), &()).unwrap());
     }
 
     #[test]
@@ -512,6 +776,30 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"12345");
+    }
+
+    /// The general path: plain URLs, no manifest, `.part` appended to the name.
+    #[test]
+    fn a_download_falls_through_mirrors_without_a_manifest() {
+        let (missing, first) = serve(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let (good, second) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("file.tar.gz");
+        let target = Target::new([format!("{missing}/a"), format!("{good}/b")])
+            .with_sha256(sha256(b"12345").to_ascii_uppercase());
+        Downloader::default()
+            .download(&target, &dest, &(), &())
+            .unwrap();
+        first.join().unwrap();
+        assert!(second.join().unwrap()[0].starts_with("GET /b "));
+        assert_eq!(fs::read(&dest).unwrap(), b"12345");
+        assert!(!part_path(&dest).exists());
+        assert_eq!(part_path(&dest), root.path().join("file.tar.gz.part"));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]

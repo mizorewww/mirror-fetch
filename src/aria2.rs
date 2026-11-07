@@ -92,6 +92,8 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .arg(format!("--rpc-listen-port={port}"))
         .arg(format!("--stop-with-process={}", std::process::id()))
         .arg(format!("--gid={gid}"))
+        .arg(format!("--max-connection-per-server={}", t.connections))
+        .arg(format!("--split={}", t.connections))
         .arg("--dir")
         .arg(dir)
         .arg("--out")
@@ -101,8 +103,6 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             "--allow-overwrite=true",
             "--auto-file-renaming=false",
             "--file-allocation=none",
-            "--max-connection-per-server=8",
-            "--split=8",
             "--min-split-size=8M",
             "--connect-timeout=15",
             "--timeout=30",
@@ -157,6 +157,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     let mut answered = false;
     let mut downloading = false;
     let mut last = (0u64, Instant::now());
+    let mut length = 0u64;
     loop {
         std::thread::sleep(Duration::from_millis(500));
         t.check()?;
@@ -175,7 +176,13 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             "aria2.tellStatus",
             serde_json::json!([
                 gid,
-                ["status", "completedLength", "errorCode", "errorMessage"]
+                [
+                    "status",
+                    "completedLength",
+                    "totalLength",
+                    "errorCode",
+                    "errorMessage"
+                ]
             ]),
         ) {
             Ok(status) => status,
@@ -188,6 +195,14 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             .as_str()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
+        let total: u64 = status["totalLength"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if total > 0 && total != length {
+            length = total;
+            t.progress.length(total);
+        }
         if completed != last.0 {
             last = (completed, Instant::now());
             if !downloading && completed > 0 {
@@ -230,7 +245,6 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::Remote;
     use crate::hub::Host;
     use crate::native::aria2_control;
     use crate::proxy::{DIRECT, Route};
@@ -240,17 +254,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let part = root.path().join("file.part");
         let host = Host::Hub("http://127.0.0.1:1".into());
-        let remote = Remote {
-            repo: "r",
-            file: "f",
-            size: 1,
-            sha256: "",
-        };
         let transfer = Transfer {
             url: "http://127.0.0.1:1/f",
             host: &host,
             part: &part,
-            remote: &remote,
+            size: Some(5),
+            bearer: None,
+            connections: 8,
             cancel: &(),
             progress: &(),
             route: &DIRECT,
@@ -273,7 +283,7 @@ mod tests {
     #[test]
     fn a_real_aria2_downloads_over_rpc_and_reports_bytes() {
         use crate::download::Progress;
-        use crate::download::test_support::{serve, sha256};
+        use crate::download::test_support::serve;
         let program = Path::new("aria2c");
         if Command::new(program).arg("--version").output().is_err() {
             return;
@@ -287,13 +297,6 @@ mod tests {
                 }
             }
         }
-        let hash = sha256(b"12345");
-        let remote = Remote {
-            repo: "r",
-            file: "f",
-            size: 5,
-            sha256: &hash,
-        };
         let (base, _server) = serve(vec![
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
         ]);
@@ -306,7 +309,9 @@ mod tests {
             url: &url,
             host: &host,
             part: &part,
-            remote: &remote,
+            size: Some(5),
+            bearer: None,
+            connections: 8,
             cancel: &(),
             progress: &last,
             route: &DIRECT,
@@ -320,18 +325,11 @@ mod tests {
     /// HTTP proxy for an `http://` file.
     #[test]
     fn a_real_aria2_uses_the_proxy() {
-        use crate::download::test_support::{serve, sha256};
+        use crate::download::test_support::serve;
         let program = Path::new("aria2c");
         if Command::new(program).arg("--version").output().is_err() {
             return;
         }
-        let hash = sha256(b"12345");
-        let remote = Remote {
-            repo: "r",
-            file: "f",
-            size: 5,
-            sha256: &hash,
-        };
         let (proxy, server) = serve(vec![
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
         ]);
@@ -343,7 +341,9 @@ mod tests {
             url: "http://models.invalid/r/resolve/main/f",
             host: &host,
             part: &part,
-            remote: &remote,
+            size: Some(5),
+            bearer: None,
+            connections: 8,
             cancel: &(),
             progress: &(),
             route: &route,

@@ -1,11 +1,18 @@
-//! Resumable, verified downloads of model files, from Hugging Face and its mirrors.
+//! Resumable, verified downloads of any HTTP(S) file from an ordered list of
+//! mirrors, with a thin Hugging Face layer on top.
 //!
-//! Each [`Host`] is tried in turn. aria2 fetches over several connections when the
-//! caller supplies its path; otherwise a built-in client resumes with HTTP ranges.
-//! Either way a host that stops sending is abandoned within a minute, and the bytes
-//! must match the published SHA-256 before they replace anything.
+//! [`Downloader::download`] takes a [`Target`]: the [`Mirror`]s that serve one file,
+//! tried in turn, and optionally its size and SHA-256. aria2 fetches over several
+//! connections when the caller supplies its path; otherwise a built-in client
+//! resumes a `.part` file with HTTP ranges. Either way a mirror that stops sending is
+//! abandoned within a minute, and the bytes must match what is expected before
+//! they replace anything.
 //!
-//! The policy belongs to the caller: which hosts, in what order, where aria2 lives,
+//! [`Downloader::fetch`] turns a [`Remote`] in a model repository into one mirror
+//! per [`Host`] (Hugging Face, hf-mirror.com, ModelScope or a configured endpoint),
+//! with its published size and hash.
+//!
+//! The policy belongs to the caller: which mirrors, in what order, where aria2 lives,
 //! and whether to ask anyone for this machine's country. The crate reads no
 //! environment variable of its own beyond the standard proxy ones (`ALL_PROXY`,
 //! `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`), which it follows for every host but
@@ -19,7 +26,10 @@ mod hub;
 mod native;
 mod proxy;
 
-pub use download::{Cancel, Downloader, Event, Phase, Progress, Remote};
+pub use download::{
+    Cancel, DEFAULT_CONNECTIONS, Downloader, Event, MAX_CONNECTIONS, Mirror, Phase, Progress,
+    Remote, Target, file_sha256, part_path,
+};
 pub use error::{Error, Failure, HostFailure};
 #[cfg(feature = "ip-lookup")]
 pub use hub::lookup_country;
