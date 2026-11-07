@@ -241,18 +241,19 @@ fn attempt(
             received: announced,
         }));
     }
-    if !resumed {
-        resume::record(
-            t.part,
-            Validator::from_headers(t.url, response.headers()).as_ref(),
-        );
-    }
     let total = t.size.or(announced);
     let mut done = if resumed { have } else { 0 };
     let mut out = if done > 0 {
         fs::OpenOptions::new().append(true).open(t.part)?
     } else {
-        fs::File::create(t.part)?
+        // Emptied before the new validator is recorded, so a crash between the
+        // two never pairs old bytes with the new version's validator.
+        let file = fs::File::create(t.part)?;
+        resume::record(
+            t.part,
+            Validator::from_headers(t.url, response.headers()).as_ref(),
+        );
+        file
     };
     *own = true;
     if resumed {

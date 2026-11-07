@@ -89,9 +89,19 @@ impl Validator {
             "etag": self.etag,
             "last_modified": self.last_modified,
         });
+        // Written whole and renamed into place, so a crash leaves the old record
+        // or the new one, never half of one.
         let write = || -> std::io::Result<()> {
-            let mut file = fs::File::create(meta_path(part))?;
-            file.write_all(value.to_string().as_bytes())
+            let path = meta_path(part);
+            let dir = path
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut file = tempfile::NamedTempFile::new_in(dir)?;
+            file.write_all(value.to_string().as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist(&path)?;
+            Ok(())
         };
         if write().is_err() {
             let _ = fs::remove_file(meta_path(part));
@@ -172,7 +182,10 @@ mod tests {
             last_modified: None,
         };
         record(&part, Some(&validator));
-        assert_eq!(Validator::load(&part), Some(validator));
+        assert_eq!(Validator::load(&part), Some(validator.clone()));
+        // Replaced in place: no temporary file is left beside it.
+        record(&part, Some(&validator));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
         fs::write(&part, b"x").unwrap();
         discard(&part);
         assert!(!part.exists());
