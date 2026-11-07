@@ -8,6 +8,8 @@ use model_fetch::{Downloader, Error, Event, Failure, Mirror, Progress, Target, p
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[derive(Default)]
 struct Log {
@@ -140,6 +142,45 @@ fn a_sha256_mismatch_everywhere_fails_and_leaves_nothing() {
     }
     assert!(!dest.exists());
     assert!(!part_path(&dest).exists());
+}
+
+/// Cancelling keeps what arrived in `.part`; the next run asks only for the rest.
+#[test]
+fn a_cancelled_download_keeps_its_part_and_resumes() {
+    struct CancelAfter<'a>(&'a AtomicBool, u64);
+    impl Progress for CancelAfter<'_> {
+        fn event(&self, event: Event<'_>) {
+            if let Event::Position { bytes } = event
+                && bytes >= self.1
+            {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    let data = payload(256 * 1024);
+    let server = Server::start();
+    server.serve(
+        "/slow",
+        Body::bytes(&data).slow(4 * 1024, Duration::from_millis(20)),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let dest = root.path().join("file.bin");
+    let target = Target::new([server.url("/slow")]).with_sha256(sha256(&data));
+    let cancel = AtomicBool::new(false);
+    let error = Downloader::default()
+        .download(&target, &dest, &cancel, &CancelAfter(&cancel, 8 * 1024))
+        .unwrap_err();
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
+    assert!(!dest.exists());
+    let kept = fs::metadata(part_path(&dest)).unwrap().len();
+    assert!(kept >= 8 * 1024 && kept < data.len() as u64, "{kept}");
+
+    server.serve("/slow", Body::bytes(&data));
+    Downloader::default()
+        .download(&target, &dest, &(), &())
+        .unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), data);
+    assert_eq!(server.requests().last().unwrap().range, Some(kept));
 }
 
 /// Neither size nor hash, nor a length from the server: the connection's end is

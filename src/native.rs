@@ -5,10 +5,13 @@ use crate::error::{Failure, Stop, is_permanent_status};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Attempts on one host that may fail without progress.
 const IDLE_ATTEMPTS: u32 = 3;
+
+/// How often a transfer asks whether it is cancelled.
+const CHECK_EVERY: Duration = Duration::from_millis(200);
 
 /// aria2's control file for `part`: its partial file is sparse, so while this exists
 /// the length of `part` is not a contiguous prefix.
@@ -25,11 +28,13 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         let _ = fs::remove_file(control);
     }
     // Hosts hand large files to a CDN, so downloads follow redirects; a token is
-    // never sent on after one.
+    // never sent on after one. The bytes are wanted as stored, not re-encoded.
     let agent = ureq::Agent::config_builder()
         .proxy(t.route.proxy())
         .max_redirects(5)
         .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+        .accept_encoding("identity")
+        .user_agent(USER_AGENT)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_per_read(Some(STALL))
         .http_status_as_error(false)
@@ -45,7 +50,16 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
                 return Ok(());
             }
             if have > size {
+                // More than expected: start over, but not forever.
                 fs::remove_file(t.part)?;
+                idle += 1;
+                if idle >= IDLE_ATTEMPTS {
+                    return Err(Failure::Incomplete {
+                        expected: size,
+                        received: have,
+                    }
+                    .into());
+                }
                 continue;
             }
         }
@@ -55,6 +69,7 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         let after = fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
         match result {
             Ok(()) => return Ok(()),
+            Err(Stop::Final(failure)) => return Err(Stop::Failed(redact(failure, t.bearer))),
             Err(Stop::Failed(failure)) => {
                 let failure = redact(failure, t.bearer);
                 // A rejected range only means this partial file no longer fits.
@@ -86,6 +101,8 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         }
     }
 }
+
+const USER_AGENT: &str = concat!("model-fetch/", env!("CARGO_PKG_VERSION"));
 
 /// Takes the token out of any text a failure carries, in case a server echoed it.
 fn redact(failure: Failure, bearer: Option<&str>) -> Failure {
@@ -170,12 +187,30 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
         return Err(Failure::Status { code, body: tail }.into());
     }
     let resumed = code == 206;
-    let (_, range_total) = content_range(&response);
+    let (start, range_total) = content_range(&response);
+    if resumed && start.is_some_and(|start| start != have) {
+        // The bytes would land in the wrong place: start this file over.
+        fs::remove_file(t.part)?;
+        return Err(Failure::Request(format!(
+            "asked for bytes from {have}, got them from {}",
+            start.unwrap_or_default()
+        ))
+        .into());
+    }
     let announced = if resumed {
         range_total
     } else {
         response.body().content_length()
     };
+    if let (Some(size), Some(announced)) = (t.size, announced)
+        && announced != size
+    {
+        // The server holds a different file: no retry will help.
+        return Err(Stop::Final(Failure::Incomplete {
+            expected: size,
+            received: announced,
+        }));
+    }
     let total = t.size.or(announced);
     let mut done = if resumed { have } else { 0 };
     let mut out = if done > 0 {
@@ -190,12 +225,13 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
     t.progress.event(Event::Position { bytes: done });
     let mut reader = response.into_body().into_reader();
     let mut buffer = vec![0u8; 512 * 1024];
-    let mut since_check = 0u64;
+    // A caller's check may read a file, so it runs a few times a second, not at
+    // every read; that is still soon enough for Ctrl-C.
+    let mut checked = Instant::now();
     loop {
-        // Every 32 MB, so a cancel need not wait out a large file.
-        if since_check >= 32 << 20 {
+        if checked.elapsed() >= CHECK_EVERY {
             t.check()?;
-            since_check = 0;
+            checked = Instant::now();
         }
         let n = reader.read(&mut buffer)?;
         if n == 0 {
@@ -203,7 +239,6 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
         }
         out.write_all(&buffer[..n])?;
         done += n as u64;
-        since_check += n as u64;
         t.progress.event(Event::Position { bytes: done });
     }
     out.sync_all()?;
@@ -354,6 +389,25 @@ mod tests {
         run(&transfer(&url, &host, &part, None)).unwrap();
         server.join().unwrap();
         assert_eq!(fs::read(&part).unwrap(), b"12345");
+    }
+
+    /// A server announcing another length holds another file: one request, no retry.
+    #[test]
+    fn a_different_announced_size_fails_at_once() {
+        let (base, server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n1234567".into(),
+        ]);
+        let url = format!("{base}/model");
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("synthetic.part");
+        let host = Host::Url(url.clone());
+        match run(&transfer(&url, &host, &part, Some(5))) {
+            Err(Stop::Failed(Failure::Incomplete { expected, received })) => {
+                assert_eq!((expected, received), (5, 7));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     /// The token goes to the mirror, not on to where it redirects, and never
