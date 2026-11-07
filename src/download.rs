@@ -526,7 +526,7 @@ impl Lock {
                 .truncate(false)
                 .write(true)
                 .open(&path)
-                .map_err(|error| opening(error, part, cfg!(windows)))?;
+                .map_err(|error| opening(error, part, cfg!(windows), present(&path)))?;
             match locking(file.try_lock(), part)? {
                 // A run that just finished may have removed the file this handle
                 // locks; then others would lock a new one, so try again.
@@ -584,13 +584,20 @@ fn locking(result: Result<(), fs::TryLockError>, part: &Path) -> std::io::Result
 
 /// On Windows, a lock file that its finishing owner has just removed stays
 /// "delete pending" while open, and opening it is denied: another download
-/// still has it.
-fn opening(error: std::io::Error, part: &Path, windows: bool) -> std::io::Error {
-    if windows && error.kind() == std::io::ErrorKind::PermissionDenied {
+/// still has it. Only when the lock file is there, though; otherwise the
+/// directory itself refuses, and that is the error to report.
+fn opening(error: std::io::Error, part: &Path, windows: bool, present: bool) -> std::io::Error {
+    if windows && present && error.kind() == std::io::ErrorKind::PermissionDenied {
         busy(part)
     } else {
         error
     }
+}
+
+/// Whether something is at `path`. A delete-pending file on Windows may deny
+/// even a look at it, which still means it is there.
+fn present(path: &Path) -> bool {
+    !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Whether `file` is still the file at `path`.
@@ -1080,13 +1087,40 @@ mod tests {
             ErrorKind::Other
         );
         let denied = || std::io::Error::from(ErrorKind::PermissionDenied);
-        let pending = opening(denied(), part, true);
+        let pending = opening(denied(), part, true, true);
         assert_eq!(pending.kind(), ErrorKind::WouldBlock);
         assert!(pending.to_string().contains("another download is writing"));
         assert_eq!(
-            opening(denied(), part, false).kind(),
+            opening(denied(), part, false, true).kind(),
             ErrorKind::PermissionDenied
         );
+    }
+
+    /// A denied open with no lock file there is the directory refusing: that
+    /// permission error is reported as it is.
+    #[test]
+    fn a_denied_open_without_a_lock_file_stays_a_permission_error() {
+        use std::io::ErrorKind;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("f.part.lock");
+        let part = Path::new("f.part");
+        assert!(!present(&path));
+        let error = opening(
+            ErrorKind::PermissionDenied.into(),
+            part,
+            true,
+            present(&path),
+        );
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        fs::write(&path, b"").unwrap();
+        assert!(present(&path));
+        let error = opening(
+            ErrorKind::PermissionDenied.into(),
+            part,
+            true,
+            present(&path),
+        );
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
     }
 
     #[test]
