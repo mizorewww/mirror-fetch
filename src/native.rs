@@ -188,13 +188,16 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
     }
     let resumed = code == 206;
     let (start, range_total) = content_range(&response);
-    if resumed && start.is_some_and(|start| start != have) {
-        // The bytes would land in the wrong place: start this file over.
+    if resumed && start != Some(have) {
+        // The bytes would land in the wrong place, or nobody says where they go:
+        // start this file over.
         fs::remove_file(t.part)?;
-        return Err(Failure::Request(format!(
-            "asked for bytes from {have}, got them from {}",
-            start.unwrap_or_default()
-        ))
+        return Err(Failure::Request(match start {
+            Some(start) => format!("asked for bytes from {have}, got them from {start}"),
+            None => {
+                format!("asked for bytes from {have}, got a 206 without a usable Content-Range")
+            }
+        })
         .into());
     }
     let announced = if resumed {
@@ -388,6 +391,26 @@ mod tests {
         let host = Host::Url(url.clone());
         run(&transfer(&url, &host, &part, None)).unwrap();
         server.join().unwrap();
+        assert_eq!(fs::read(&part).unwrap(), b"12345");
+    }
+
+    /// A 206 that does not say where its bytes start is not appended.
+    #[test]
+    fn a_partial_answer_without_a_content_range_restarts_the_file() {
+        let (base, server) = serve(vec![
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345"
+                .into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
+        ]);
+        let url = format!("{base}/model");
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("synthetic.part");
+        fs::write(&part, b"12").unwrap();
+        let host = Host::Url(url.clone());
+        run(&transfer(&url, &host, &part, Some(5))).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].to_ascii_lowercase().contains("range: bytes=2-"));
+        assert!(!requests[1].to_ascii_lowercase().contains("range:"));
         assert_eq!(fs::read(&part).unwrap(), b"12345");
     }
 
