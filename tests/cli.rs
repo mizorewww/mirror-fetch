@@ -7,6 +7,7 @@ mod common;
 use common::{Body, Server, payload, sha256};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 fn program() -> Command {
