@@ -227,7 +227,128 @@ fn hf_downloads_files_across_endpoints_keeping_their_paths() {
     for request in first.requests().iter().chain(&second.requests()) {
         assert_eq!(request.authorization, None, "{request:?}");
     }
-    assert_eq!(first.requests().len(), 2);
+    // A HEAD for the metadata and a GET, for each file.
+    assert_eq!(first.requests().len(), 4);
+}
+
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The Hub's size and hash are checked; the files come from the commit the
+/// revision named; a second run finds them complete and downloads nothing.
+#[test]
+fn hf_verifies_against_the_hub_and_skips_complete_files() {
+    let weights = payload(80_000);
+    let config = b"{}\n".to_vec();
+    let cdn = Server::start();
+    cdn.serve("/blob", Body::bytes(&weights));
+    let hub = Server::start();
+    for revision in ["main", COMMIT] {
+        hub.serve(
+            &format!("/org/model/resolve/{revision}/w.bin"),
+            Body::redirect(cdn.url("/blob"))
+                .with_header("X-Linked-Size", &weights.len().to_string())
+                .with_header("X-Linked-Etag", &format!("\"{}\"", sha256(&weights)))
+                .with_header("X-Repo-Commit", COMMIT),
+        );
+        hub.serve(
+            &format!("/org/model/resolve/{revision}/config.json"),
+            Body::bytes(&config)
+                .with_etag(&format!("\"{}\"", common::git_sha1(&config)))
+                .with_header("X-Repo-Commit", COMMIT),
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let args = [
+        "hf",
+        "org/model",
+        "w.bin",
+        "config.json",
+        "--endpoint",
+        &hub.base(),
+        "-o",
+        arg(root.path()),
+    ];
+    let (code, _, stderr) = run(program().args(args));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("w.bin (78.1 KiB, sha256 verified)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("config.json (3 B, git hash verified)"),
+        "{stderr}"
+    );
+    let gets: Vec<String> = hub
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "GET")
+        .map(|r| r.path)
+        .collect();
+    assert!(gets.iter().all(|path| path.contains(COMMIT)), "{gets:?}");
+
+    let gets = |server: &Server| {
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "GET")
+            .count()
+    };
+    let before = (gets(&hub), gets(&cdn));
+    let (code, _, stderr) = run(program().args(args));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stderr.matches("already complete").count(), 2, "{stderr}");
+    assert_eq!(
+        (gets(&hub), gets(&cdn)),
+        before,
+        "only HEADs the second time"
+    );
+}
+
+/// The bytes do not match the Hub's hash: nothing is saved.
+#[test]
+fn hf_rejects_bytes_that_differ_from_the_hub() {
+    let hub = Server::start();
+    hub.serve(
+        "/org/model/resolve/main/w.bin",
+        Body::bytes(b"tampered")
+            .with_header("X-Linked-Etag", &format!("\"{}\"", sha256(b"original"))),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(program().args([
+        "hf",
+        "org/model",
+        "w.bin",
+        "--endpoint",
+        &hub.base(),
+        "-o",
+        arg(root.path()),
+    ]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+    assert!(!root.path().join("w.bin").exists());
+}
+
+/// A hub that gives no metadata still serves the file, said to be unverified.
+#[test]
+fn hf_without_metadata_says_unverified() {
+    let hub = Server::start();
+    hub.serve(
+        "/org/model/resolve/main/a.txt",
+        Body::bytes(b"a").without_head(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(program().args([
+        "hf",
+        "org/model",
+        "a.txt",
+        "--endpoint",
+        &hub.base(),
+        "-o",
+        arg(root.path()),
+    ]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("the Hub gave no size or hash"), "{stderr}");
+    assert!(stderr.contains("a.txt (1 B, unverified)"), "{stderr}");
 }
 
 /// HF_ENDPOINT comes first; it answers, so the public hosts after it are never asked.

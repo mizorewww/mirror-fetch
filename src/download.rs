@@ -86,6 +86,10 @@ impl Mirror {
     pub fn has_bearer(&self) -> bool {
         self.bearer.is_some()
     }
+
+    pub(crate) fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
+    }
 }
 
 impl fmt::Debug for Mirror {
@@ -107,6 +111,10 @@ pub struct Target {
     pub size: Option<u64>,
     /// Lower-case hex; [`Target::with_sha256`] lower-cases it.
     pub sha256: Option<String>,
+    /// Git's blob hash (SHA-1 of `blob <length>\0` and the bytes), as the Hub
+    /// gives for files not stored in LFS; lower-case hex. Checked when there is no
+    /// SHA-256.
+    pub git_sha1: Option<String>,
 }
 
 impl Target {
@@ -130,6 +138,16 @@ impl Target {
     pub fn with_sha256(mut self, hex: impl AsRef<str>) -> Self {
         self.sha256 = Some(hex.as_ref().trim().to_ascii_lowercase());
         self
+    }
+
+    pub fn with_git_sha1(mut self, hex: impl AsRef<str>) -> Self {
+        self.git_sha1 = Some(hex.as_ref().trim().to_ascii_lowercase());
+        self
+    }
+
+    /// Whether the bytes will be checked against a hash.
+    pub fn has_hash(&self) -> bool {
+        self.sha256.is_some() || self.git_sha1.is_some()
     }
 }
 
@@ -303,6 +321,10 @@ impl Downloader {
         &self.hosts
     }
 
+    pub(crate) fn route(&self) -> &Route {
+        &self.route
+    }
+
     #[cfg(test)]
     pub(crate) fn routed(mut self, route: Route) -> Self {
         self.route = route;
@@ -330,6 +352,7 @@ impl Downloader {
         let expect = Expect {
             size: target.size,
             sha256: target.sha256.as_deref(),
+            git_sha1: target.git_sha1.as_deref(),
         };
         self.run(
             &target.mirrors,
@@ -360,6 +383,7 @@ impl Downloader {
         let expect = Expect {
             size: Some(remote.size),
             sha256: Some(remote.sha256),
+            git_sha1: None,
         };
         self.run(
             &mirrors,
@@ -389,7 +413,7 @@ impl Downloader {
         // Two runs writing one partial file would interleave their bytes.
         let _lock = Lock::acquire(part).map_err(Error::Io)?;
         let mut failures = Vec::new();
-        let verified = expect.sha256.is_some();
+        let verified = expect.sha256.is_some() || expect.git_sha1.is_some();
         for (index, mirror) in mirrors.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -549,6 +573,7 @@ fn is_at(_file: &fs::File, path: &Path) -> bool {
 pub(crate) struct Expect<'a> {
     pub size: Option<u64>,
     pub sha256: Option<&'a str>,
+    pub git_sha1: Option<&'a str>,
 }
 
 /// `dest` with `.part` appended, so `a.tar.gz` and `a.zip` do not share one.
@@ -556,6 +581,29 @@ pub fn part_path(dest: &Path) -> PathBuf {
     let mut name = dest.as_os_str().to_owned();
     name.push(".part");
     PathBuf::from(name)
+}
+
+/// Whether the file at `path` is `target`'s, judged by its size and hash. False
+/// when the target has no hash: without one, nothing shows the file is whole.
+pub fn file_matches(
+    path: &Path,
+    target: &Target,
+    cancel: &dyn Cancel,
+    progress: &dyn Progress,
+) -> Result<bool, Error> {
+    if !target.has_hash() {
+        return Ok(false);
+    }
+    let expect = Expect {
+        size: target.size,
+        sha256: target.sha256.as_deref(),
+        git_sha1: target.git_sha1.as_deref(),
+    };
+    match check(path, expect, cancel, progress) {
+        Ok(failure) => Ok(failure.is_none()),
+        Err(Stop::Failed(Failure::Io(error))) => Err(Error::Io(error)),
+        Err(_) => Err(Error::Cancelled),
+    }
 }
 
 /// The lower-case hex SHA-256 of the file at `path`, reporting
@@ -572,8 +620,25 @@ pub fn file_sha256(
     }
 }
 
+/// Which digest to compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Sha256,
+    /// SHA-1 over `blob <length>\0` and the bytes, as `git hash-object` does.
+    GitBlob,
+}
+
 fn hash_file(path: &Path, cancel: &dyn Cancel, progress: &dyn Progress) -> Result<String, Stop> {
-    use sha2::{Digest, Sha256};
+    digest_file(path, Kind::Sha256, cancel, progress)
+}
+
+fn digest_file(
+    path: &Path,
+    kind: Kind,
+    cancel: &dyn Cancel,
+    progress: &dyn Progress,
+) -> Result<String, Stop> {
+    use sha2::Digest;
     let mut file = fs::File::open(path)?;
     progress.event(Event::Phase {
         phase: Phase::Verify,
@@ -583,7 +648,11 @@ fn hash_file(path: &Path, cancel: &dyn Cancel, progress: &dyn Progress) -> Resul
         progress.length(metadata.len());
     }
     progress.event(Event::Position { bytes: 0 });
-    let mut hash = Sha256::new();
+    let mut sha256 = sha2::Sha256::new();
+    let mut sha1 = sha1::Sha1::new();
+    if kind == Kind::GitBlob {
+        sha1.update(format!("blob {}\0", file.metadata()?.len()).as_bytes());
+    }
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut done = 0u64;
     loop {
@@ -594,11 +663,18 @@ fn hash_file(path: &Path, cancel: &dyn Cancel, progress: &dyn Progress) -> Resul
         if n == 0 {
             break;
         }
-        hash.update(&buffer[..n]);
+        match kind {
+            Kind::Sha256 => sha256.update(&buffer[..n]),
+            Kind::GitBlob => sha1.update(&buffer[..n]),
+        }
         done += n as u64;
         progress.event(Event::Position { bytes: done });
     }
-    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    let bytes: Vec<u8> = match kind {
+        Kind::Sha256 => sha256.finalize().to_vec(),
+        Kind::GitBlob => sha1.finalize().to_vec(),
+    };
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Whether `part` has the expected size and SHA-256, where they are known.
@@ -629,10 +705,12 @@ pub(crate) fn check(
             }));
         }
     }
-    let Some(expected) = expect.sha256 else {
-        return Ok(None);
+    let (expected, kind) = match (expect.sha256, expect.git_sha1) {
+        (Some(sha256), _) => (sha256, Kind::Sha256),
+        (None, Some(sha1)) => (sha1, Kind::GitBlob),
+        (None, None) => return Ok(None),
     };
-    let digest = hash_file(part, cancel, progress)?;
+    let digest = digest_file(part, kind, cancel, progress)?;
     if digest.eq_ignore_ascii_case(expected.trim()) {
         return Ok(None);
     }
@@ -775,6 +853,7 @@ mod tests {
         let expect = Expect {
             size: Some(remote.size),
             sha256: Some(remote.sha256),
+            git_sha1: None,
         };
         fs::write(&part, b"12346").unwrap();
         assert!(!verify(&part, expect, &(), &()).unwrap());
@@ -786,11 +865,13 @@ mod tests {
         let only_hash = Expect {
             size: None,
             sha256: Some(&upper),
+            git_sha1: None,
         };
         assert!(verify(&part, only_hash, &(), &()).unwrap());
         let nothing = Expect {
             size: None,
             sha256: None,
+            git_sha1: None,
         };
         fs::write(&part, b"anything").unwrap();
         assert!(verify(&part, nothing, &(), &()).unwrap());
@@ -930,6 +1011,7 @@ mod tests {
         let expect = Expect {
             size: Some(5),
             sha256: Some("00"),
+            git_sha1: None,
         };
         match check(&part, expect, &(), &()).unwrap() {
             Some(Failure::Incomplete { expected, received }) => {

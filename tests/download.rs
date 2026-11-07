@@ -213,7 +213,7 @@ fn a_bearer_mirror_sends_its_token_and_others_do_not() {
             Mirror::new(server.url("/public")),
         ],
         size: Some(5),
-        sha256: None,
+        ..Target::default()
     };
     Downloader::default()
         .download(&target, &root.path().join("f"), &(), &())

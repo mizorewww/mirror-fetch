@@ -27,6 +27,10 @@ pub struct Body {
     etag: Option<String>,
     /// The status every request with a `Range` gets instead of bytes.
     range_status: Option<u16>,
+    /// Sent with every answer.
+    headers: Vec<(String, String)>,
+    /// `HEAD` gets 405.
+    no_head: bool,
 }
 
 impl Body {
@@ -74,6 +78,16 @@ impl Body {
 
     pub fn with_etag(mut self, etag: &str) -> Self {
         self.etag = Some(etag.to_owned());
+        self
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub fn without_head(mut self) -> Self {
+        self.no_head = true;
         self
     }
 
@@ -225,11 +239,22 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
         );
         return;
     };
+    let extra: String = body
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    if body.no_head && method == "HEAD" {
+        let _ = stream.write_all(
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        return;
+    }
     if let Some(code) = body.status {
         let location = body
             .location
-            .map(|to| format!("Location: {to}\r\n"))
-            .unwrap_or_default();
+            .map(|to| format!("Location: {to}\r\n{extra}"))
+            .unwrap_or_else(|| extra.clone());
         let text = format!("status {code}");
         let _ = stream.write_all(
             format!(
@@ -276,6 +301,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
     if let Some(etag) = &body.etag {
         head.push_str(&format!("ETag: {etag}\r\n"));
     }
+    head.push_str(&extra);
     head.push_str("Connection: close\r\n\r\n");
     if stream.write_all(head.as_bytes()).is_err() || method == "HEAD" {
         return;
@@ -312,6 +338,15 @@ pub fn sha256(data: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Git's blob hash, as the Hub gives for files outside LFS.
+pub fn git_sha1(data: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hash = Sha1::new();
+    hash.update(format!("blob {}\0", data.len()).as_bytes());
+    hash.update(data);
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Deterministic bytes, so a resumed file can be compared with the original.

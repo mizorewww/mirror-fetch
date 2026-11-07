@@ -6,7 +6,7 @@ mod progress;
 
 use clap::{Args, Parser, Subcommand};
 use model_fetch::{
-    Cancel, Downloader, Error, Host, HubFile, MIRROR, ORIGIN, Target, file_sha256,
+    Cancel, Downloader, Error, Host, HubFile, MIRROR, ORIGIN, Target, file_matches, file_sha256,
     normalize_endpoint, part_path,
 };
 use progress::{Printer, human_bytes};
@@ -391,12 +391,44 @@ fn run_hf(hf: Hf) -> Outcome {
     let downloader = downloader(&hf.transfer);
     let mut failed = 0;
     for (file, path) in hf.files.iter().zip(&paths) {
-        let target = match HubFile::new(&hf.repo, file)
-            .at(&hf.revision)
-            .target(&hosts, token.as_deref())
-        {
-            Ok(target) => target,
+        let file = HubFile::new(&hf.repo, file).at(&hf.revision);
+        let mirrors = match file.mirrors(&hosts, token.as_deref()) {
+            Ok(mirrors) => mirrors,
             Err(reason) => return usage(reason),
+        };
+        // The Hub's size and hash, at the commit the revision names, so a branch
+        // that moves meanwhile cannot mix two versions.
+        let target = match downloader.hub_metadata(&mirrors) {
+            Ok(metadata) => {
+                let pinned = match &metadata.commit {
+                    Some(commit) => file.at(commit),
+                    None => file,
+                };
+                match pinned.target(&hosts, token.as_deref()) {
+                    Ok(target) => metadata.apply(target),
+                    Err(reason) => return usage(reason),
+                }
+            }
+            Err(reason) => {
+                if !hf.transfer.quiet {
+                    let why = match &reason {
+                        Error::AllHostsFailed(failures) => failures
+                            .iter()
+                            .map(|failed| format!("{}: {}", failed.host, failed.failure))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        other => other.to_string(),
+                    };
+                    eprintln!(
+                        "{}: the Hub gave no size or hash ({why}); the download will be unverified",
+                        file.file
+                    );
+                }
+                Target {
+                    mirrors,
+                    ..Target::default()
+                }
+            }
         };
         match download(
             &downloader,
@@ -463,6 +495,19 @@ fn report_cancelled(part: Option<&Path>) {
     }
 }
 
+/// How a finished file was checked.
+fn checked(target: &Target) -> &'static str {
+    if target.sha256.is_some() {
+        "sha256 verified"
+    } else if target.git_sha1.is_some() {
+        "git hash verified"
+    } else if target.size.is_some() {
+        "size checked, unverified"
+    } else {
+        "unverified"
+    }
+}
+
 /// One file: skip it if already verified, else download, and say how it went.
 fn download(downloader: &Downloader, target: &Target, dest: &Path, quiet: bool) -> Outcome {
     let label = dest
@@ -470,17 +515,12 @@ fn download(downloader: &Downloader, target: &Target, dest: &Path, quiet: bool) 
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| dest.display().to_string());
     let printer = Printer::new(&label, quiet);
-    if let Some(expected) = &target.sha256
-        && dest.is_file()
-        && target
-            .size
-            .is_none_or(|size| std::fs::metadata(dest).is_ok_and(|m| m.len() == size))
-    {
-        match file_sha256(dest, &CtrlC, &printer) {
-            Ok(actual) if &actual == expected => {
+    if dest.is_file() && target.has_hash() {
+        match file_matches(dest, target, &CtrlC, &printer) {
+            Ok(true) => {
                 printer.finish();
                 if !quiet {
-                    eprintln!("{}: already complete (sha256 verified)", dest.display());
+                    eprintln!("{}: already complete ({})", dest.display(), checked(target));
                 }
                 return Outcome::Done;
             }
@@ -507,12 +547,12 @@ fn download(downloader: &Downloader, target: &Target, dest: &Path, quiet: bool) 
         Ok(()) => {
             if !quiet {
                 let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-                let checked = if target.sha256.is_some() {
-                    ", sha256 verified"
-                } else {
-                    ""
-                };
-                eprintln!("saved {} ({}{checked})", dest.display(), human_bytes(size));
+                eprintln!(
+                    "saved {} ({}, {})",
+                    dest.display(),
+                    human_bytes(size),
+                    checked(target)
+                );
             }
             Outcome::Done
         }

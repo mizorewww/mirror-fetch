@@ -329,6 +329,7 @@ mod tests {
         let expect = Expect {
             size,
             sha256: Some(&hash),
+            git_sha1: None,
         };
         assert!(crate::download::verify(&part, expect, &(), &()).unwrap());
     }

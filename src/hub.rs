@@ -8,7 +8,10 @@
 //! This module holds the mechanism. The caller decides what is configured, what the
 //! country is and whether anyone is asked: [`Endpoints::choose`] takes both as values.
 
-use crate::download::{Mirror, Target};
+use crate::download::{Downloader, Mirror, Target};
+use crate::error::{Error, Failure, HostFailure};
+use crate::http::{self, Follow, Method};
+use std::time::Duration;
 
 pub const ORIGIN: &str = "https://huggingface.co";
 pub const MIRROR: &str = "https://hf-mirror.com";
@@ -186,6 +189,124 @@ impl<'a> HubFile<'a> {
             mirrors: self.mirrors(hosts, token)?,
             ..Target::default()
         })
+    }
+}
+
+/// What a hub says about one file, from the headers of a `HEAD` on its URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubMetadata {
+    /// The host that answered.
+    pub host: Host,
+    /// `X-Linked-Size` for a file in LFS, else `Content-Length`.
+    pub size: Option<u64>,
+    /// `X-Linked-Etag` for a file in LFS: its SHA-256.
+    pub sha256: Option<String>,
+    /// The `ETag` of a file kept in Git itself: its blob hash.
+    pub git_sha1: Option<String>,
+    /// `X-Repo-Commit`: the commit the revision named. Downloading at it keeps
+    /// the file from changing under a moving branch.
+    pub commit: Option<String>,
+}
+
+impl HubMetadata {
+    /// `target` with this size and hash.
+    pub fn apply(&self, mut target: Target) -> Target {
+        if let Some(size) = self.size {
+            target = target.with_size(size);
+        }
+        if let Some(sha256) = &self.sha256 {
+            target = target.with_sha256(sha256);
+        }
+        if let Some(sha1) = &self.git_sha1 {
+            target = target.with_git_sha1(sha1);
+        }
+        target
+    }
+
+    fn from_headers(host: &Host, code: u16, headers: &ureq::http::HeaderMap) -> Option<Self> {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| {
+                    value
+                        .trim()
+                        .trim_start_matches("W/")
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .filter(|value| !value.is_empty())
+        };
+        let hex = |value: String, len: usize| {
+            (value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| value.to_ascii_lowercase())
+        };
+        let linked = text("x-linked-etag").and_then(|tag| hex(tag, 64));
+        let (size, sha256, git_sha1) = if linked.is_some() {
+            let size = text("x-linked-size").and_then(|size| size.parse().ok());
+            (size, linked, None)
+        } else if (200..300).contains(&code) {
+            // Not in LFS: the hub answers for the file itself.
+            let size = text("content-length").and_then(|size| size.parse().ok());
+            (size, None, text("etag").and_then(|tag| hex(tag, 40)))
+        } else {
+            (None, None, None)
+        };
+        let commit = text("x-repo-commit").and_then(|commit| hex(commit, 40));
+        (size.is_some() || sha256.is_some() || git_sha1.is_some()).then(|| Self {
+            host: host.clone(),
+            size,
+            sha256,
+            git_sha1,
+            commit,
+        })
+    }
+}
+
+impl Downloader {
+    /// Asks each of `mirrors` (from [`HubFile::mirrors`]) in turn for the file's
+    /// size and hash: a `HEAD` that follows only redirects on its own origin, so
+    /// the hub's own headers are read before any CDN's. A token is sent as for the
+    /// download. [`Error::AllHostsFailed`] when no hub says anything useful.
+    pub fn hub_metadata(&self, mirrors: &[Mirror]) -> Result<HubMetadata, Error> {
+        let agent = http::agent(self.route(), Duration::from_secs(30));
+        let mut failures = Vec::new();
+        for mirror in mirrors {
+            let failure = match http::send(
+                &agent,
+                Method::Head,
+                mirror.url(),
+                &[],
+                mirror.bearer(),
+                Follow::SameOrigin,
+            ) {
+                Ok(response) => {
+                    let code = response.status().as_u16();
+                    if let Some(found) =
+                        HubMetadata::from_headers(mirror.host(), code, response.headers())
+                    {
+                        return Ok(found);
+                    }
+                    if code >= 400 {
+                        Failure::Status {
+                            code,
+                            body: String::new(),
+                        }
+                    } else {
+                        Failure::Request(format!("HTTP {code} without a size or hash"))
+                    }
+                }
+                Err(message) => Failure::Request(match mirror.bearer() {
+                    Some(token) => message.replace(token, "<redacted>"),
+                    None => message,
+                }),
+            };
+            failures.push(HostFailure {
+                host: mirror.host().name(),
+                failure,
+            });
+        }
+        Err(Error::AllHostsFailed(failures))
     }
 }
 
