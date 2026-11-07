@@ -66,8 +66,8 @@ otherwise `HF_ENDPOINT` if set, then `https://huggingface.co`, then
 
 `HF_TOKEN`, if set, is sent as a bearer token only to `huggingface.co` and `hf.co`
 (and their subdomains) over HTTPS: never to hf-mirror.com or another endpoint, never
-after a redirect, never to aria2 (those requests use the built-in client), and never
-printed.
+past a redirect to another origin, never to aria2 (those requests use the built-in
+client), and never printed.
 
 ### `verify`
 

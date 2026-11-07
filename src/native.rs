@@ -2,6 +2,7 @@
 
 use crate::download::{Event, Phase, STALL, Transfer};
 use crate::error::{Failure, Stop, is_permanent_status};
+use crate::http::{self, Follow};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -27,19 +28,9 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         let _ = fs::remove_file(t.part);
         let _ = fs::remove_file(control);
     }
-    // Hosts hand large files to a CDN, so downloads follow redirects; a token is
-    // never sent on after one. The bytes are wanted as stored, not re-encoded.
-    let agent = ureq::Agent::config_builder()
-        .proxy(t.route.proxy())
-        .max_redirects(5)
-        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
-        .accept_encoding("identity")
-        .user_agent(USER_AGENT)
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_per_read(Some(STALL))
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    // Hosts hand large files to a CDN, so downloads follow redirects; a token
+    // follows only those that stay on the mirror's origin.
+    let agent = http::agent(t.route, STALL);
     let mut idle = 0;
     let mut phase = Phase::Connect;
     loop {
@@ -102,8 +93,6 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
     }
 }
 
-const USER_AGENT: &str = concat!("model-fetch/", env!("CARGO_PKG_VERSION"));
-
 /// Takes the token out of any text a failure carries, in case a server echoed it.
 fn redact(failure: Failure, bearer: Option<&str>) -> Failure {
     let Some(token) = bearer.filter(|token| !token.is_empty()) else {
@@ -161,18 +150,14 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
         url: t.url,
         from: have,
     });
-    let mut request = agent.get(t.url);
+    let mut headers = Vec::new();
     if have > 0 {
-        request = request.header("Range", &format!("bytes={have}-"));
+        headers.push(("Range", format!("bytes={have}-")));
     }
-    if let Some(token) = t.bearer {
-        request = request.header("Authorization", &format!("Bearer {token}"));
-    }
-    let mut response = request
-        .call()
-        .map_err(|error| Failure::Request(error.to_string()))?;
+    let mut response =
+        http::send(agent, t.url, &headers, t.bearer, Follow::All).map_err(Failure::Request)?;
     let code = response.status().as_u16();
-    if code >= 400 {
+    if code != 200 && code != 206 {
         // Without an expected size, a range past the end may mean the file is whole.
         if code == 416 && have > 0 && t.size.is_none() && content_range(&response).1 == Some(have) {
             return Ok(());
@@ -433,8 +418,28 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
-    /// The token goes to the mirror, not on to where it redirects, and never
-    /// into a failure's text.
+    /// The token follows a redirect on the mirror's own origin.
+    #[test]
+    fn a_bearer_token_follows_a_same_origin_redirect() {
+        let (base, server) = serve(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /renamed/model\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
+        ]);
+        let url = format!("{base}/model");
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("synthetic.part");
+        let host = Host::Url(url.clone());
+        let mut t = transfer(&url, &host, &part, Some(5));
+        t.bearer = Some("hf_secret");
+        run(&t).unwrap();
+        let heads = server.join().unwrap();
+        assert!(heads[1].starts_with("GET /renamed/model "), "{}", heads[1]);
+        assert!(heads[1].contains("Bearer hf_secret"), "{}", heads[1]);
+        assert_eq!(fs::read(&part).unwrap(), b"12345");
+    }
+
+    /// The token goes to the mirror, not on to another origin it redirects to
+    /// (here the same address on another port), and never into a failure's text.
     #[test]
     fn a_bearer_token_stays_with_its_host() {
         let (cdn, cdn_server) = serve(vec![

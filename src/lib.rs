@@ -24,6 +24,7 @@
 mod aria2;
 mod download;
 mod error;
+mod http;
 mod hub;
 mod native;
 mod proxy;

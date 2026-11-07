@@ -34,8 +34,9 @@ pub struct Remote<'a> {
 
 /// One URL that serves a file, and the [`Host`] that events name for it.
 ///
-/// A mirror may carry a bearer token. It is sent only with requests to this
-/// mirror's URL, never after a redirect, and never handed to aria2: a mirror with a
+/// A mirror may carry a bearer token. It is sent only to this mirror's origin
+/// (scheme, host and port): it follows a redirect that stays there and is dropped
+/// for good at one that leaves. It is never handed to aria2, so a mirror with a
 /// token always uses the built-in client. `Debug` does not show it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Mirror {
@@ -423,7 +424,7 @@ impl Downloader {
     }
 
     fn transfer(&self, transfer: &Transfer) -> Result<(), Stop> {
-        // A token never leaves the built-in client, which drops it on redirects.
+        // A token never leaves the built-in client, which keeps it on its origin.
         let program = self
             .aria2
             .as_deref()
