@@ -8,6 +8,8 @@
 //! This module holds the mechanism. The caller decides what is configured, what the
 //! country is and whether anyone is asked: [`Endpoints::choose`] takes both as values.
 
+use crate::download::{Mirror, Target};
+
 pub const ORIGIN: &str = "https://huggingface.co";
 pub const MIRROR: &str = "https://hf-mirror.com";
 const MODELSCOPE: &str = "https://modelscope.cn";
@@ -23,12 +25,30 @@ pub enum Host {
 }
 
 impl Host {
-    /// The file at revision `main` (ModelScope's `master`). A [`Host::Url`] is
-    /// already the file.
+    /// The file at revision `main` (ModelScope's `master`).
     pub fn file_url(&self, repo: &str, file: &str) -> String {
+        self.file_url_at(repo, "main", file)
+    }
+
+    /// The file at `revision`: a branch, tag or commit. A `/` in the revision is
+    /// escaped (`refs/pr/1` → `refs%2Fpr%2F1`); the file's own `/` separate
+    /// directories. A [`Host::Url`] is already the file and ignores all three.
+    pub fn file_url_at(&self, repo: &str, revision: &str, file: &str) -> String {
+        let repo = escape(repo, true);
+        let file = escape(file, true);
         match self {
-            Self::Hub(base) => format!("{base}/{repo}/resolve/main/{file}"),
-            Self::ModelScope => format!("{MODELSCOPE}/models/{repo}/resolve/master/{file}"),
+            Self::Hub(base) => format!("{base}/{repo}/resolve/{}/{file}", escape(revision, false)),
+            Self::ModelScope => {
+                let revision = if revision == "main" {
+                    "master"
+                } else {
+                    revision
+                };
+                format!(
+                    "{MODELSCOPE}/models/{repo}/resolve/{}/{file}",
+                    escape(revision, false)
+                )
+            }
             Self::Url(url) => url.clone(),
         }
     }
@@ -38,6 +58,93 @@ impl Host {
         match self {
             Self::Hub(base) | Self::Url(base) => host_name(base),
             Self::ModelScope => host_name(MODELSCOPE),
+        }
+    }
+
+    /// Whether this is Hugging Face itself, over HTTPS: `huggingface.co`, `hf.co`
+    /// or a subdomain of either. Only these are given a Hugging Face token.
+    pub fn is_hugging_face(&self) -> bool {
+        let Self::Hub(base) = self else {
+            return false;
+        };
+        let Ok(url) = url::Url::parse(base) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        url.scheme() == "https"
+            && ["huggingface.co", "hf.co"]
+                .iter()
+                .any(|own| host == *own || host.ends_with(&format!(".{own}")))
+    }
+}
+
+/// Percent-escapes everything but unreserved characters, and `/` when `slashes`.
+fn escape(text: &str, slashes: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b'/' if slashes => out.push('/'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// A file in a Hugging Face (or ModelScope) repository, at a revision. It becomes
+/// one [`Mirror`] per host; size and hash are added to the [`Target`] when known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HubFile<'a> {
+    /// `org/name`.
+    pub repo: &'a str,
+    /// A branch, tag or commit; `main` unless set.
+    pub revision: &'a str,
+    /// The path inside the repository, `/`-separated.
+    pub file: &'a str,
+}
+
+impl<'a> HubFile<'a> {
+    pub fn new(repo: &'a str, file: &'a str) -> Self {
+        Self {
+            repo,
+            revision: "main",
+            file,
+        }
+    }
+
+    pub fn at(mut self, revision: &'a str) -> Self {
+        self.revision = revision;
+        self
+    }
+
+    /// One mirror per host, in order. `token` goes only to hosts that
+    /// [`Host::is_hugging_face`]; a third-party mirror never sees it.
+    pub fn mirrors(&self, hosts: &[Host], token: Option<&str>) -> Vec<Mirror> {
+        hosts
+            .iter()
+            .map(|host| {
+                let mirror = Mirror::on(
+                    host.clone(),
+                    host.file_url_at(self.repo, self.revision, self.file),
+                );
+                match token {
+                    Some(token) if host.is_hugging_face() => mirror.with_bearer(token),
+                    _ => mirror,
+                }
+            })
+            .collect()
+    }
+
+    /// [`HubFile::mirrors`] as a [`Target`], without size or hash.
+    pub fn target(&self, hosts: &[Host], token: Option<&str>) -> Target {
+        Target {
+            mirrors: self.mirrors(hosts, token),
+            ..Target::default()
         }
     }
 }
@@ -357,6 +464,63 @@ mod tests {
         );
         assert_eq!(ipip(r#""中国","香港","""#).as_deref(), Some("HK"));
         assert_eq!(ipip(r#""美国","加利福尼亚""#).as_deref(), Some("ZZ"));
+    }
+
+    #[test]
+    fn revisions_and_paths_are_escaped() {
+        let origin = Host::Hub(ORIGIN.into());
+        assert_eq!(
+            origin.file_url_at("org/repo", "refs/pr/1", "onnx/model q.onnx"),
+            "https://huggingface.co/org/repo/resolve/refs%2Fpr%2F1/onnx/model%20q.onnx"
+        );
+        assert_eq!(
+            Host::ModelScope.file_url_at("org/repo", "v1.0", "a.bin"),
+            "https://modelscope.cn/models/org/repo/resolve/v1.0/a.bin"
+        );
+        let url = Host::Url("https://example.org/x?y=1".into());
+        assert_eq!(url.file_url_at("a", "b", "c"), "https://example.org/x?y=1");
+        assert_eq!(url.name(), "example.org");
+    }
+
+    #[test]
+    fn only_hugging_face_over_https_counts_as_hugging_face() {
+        for base in [
+            ORIGIN,
+            "https://hf.co",
+            "https://cdn-lfs.huggingface.co",
+            "https://HuggingFace.co.",
+        ] {
+            assert!(Host::Hub(base.into()).is_hugging_face(), "{base}");
+        }
+        for base in [
+            MIRROR,
+            "http://huggingface.co",
+            "https://huggingface.co.evil.example",
+            "https://nothuggingface.co",
+            "https://evil.example/huggingface.co",
+        ] {
+            assert!(!Host::Hub(base.into()).is_hugging_face(), "{base}");
+        }
+        assert!(!Host::ModelScope.is_hugging_face());
+        assert!(!Host::Url(format!("{ORIGIN}/a/resolve/main/b")).is_hugging_face());
+    }
+
+    #[test]
+    fn a_hub_file_gives_its_token_only_to_hugging_face() {
+        let hosts = [Host::Hub(MIRROR.into()), Host::Hub(ORIGIN.into())];
+        let file = HubFile::new("org/repo", "a.gguf").at("v2");
+        let mirrors = file.mirrors(&hosts, Some("hf_secret"));
+        assert_eq!(
+            mirrors[0].url(),
+            "https://hf-mirror.com/org/repo/resolve/v2/a.gguf"
+        );
+        assert!(!mirrors[0].has_bearer());
+        assert!(mirrors[1].has_bearer());
+        assert_eq!(mirrors[1].host(), &hosts[1]);
+        assert!(!format!("{mirrors:?}").contains("hf_secret"));
+        let target = file.target(&hosts, None);
+        assert!(target.mirrors.iter().all(|mirror| !mirror.has_bearer()));
+        assert_eq!((target.size, target.sha256), (None, None));
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub const MAX_CONNECTIONS: u32 = 16;
 /// A file published in a model repository, with its size and SHA-256.
 ///
 /// [`Downloader::fetch`] takes it with the downloader's hosts, at revision `main`.
+/// [`HubFile`](crate::HubFile) names other revisions and leaves size and hash
+/// optional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Remote<'a> {
     pub repo: &'a str,
@@ -53,7 +55,7 @@ impl Mirror {
         }
     }
 
-    /// `url`, reported as `host`: how [`Downloader::fetch`] names its hosts.
+    /// `url`, reported as `host`: how a [`HubFile`](crate::HubFile) names its hosts.
     pub fn on(host: Host, url: impl Into<String>) -> Self {
         Self {
             host,

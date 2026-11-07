@@ -8,9 +8,10 @@
 //! abandoned within a minute, and the bytes must match what is expected before
 //! they replace anything.
 //!
-//! [`Downloader::fetch`] turns a [`Remote`] in a model repository into one mirror
-//! per [`Host`] (Hugging Face, hf-mirror.com, ModelScope or a configured endpoint),
-//! with its published size and hash.
+//! [`HubFile`] turns a repository, revision and file into one mirror per [`Host`]
+//! (Hugging Face, hf-mirror.com, ModelScope or a configured endpoint), giving a
+//! token only to Hugging Face itself. [`Downloader::fetch`] does that for a
+//! [`Remote`] whose size and hash are published.
 //!
 //! The policy belongs to the caller: which mirrors, in what order, where aria2 lives,
 //! and whether to ask anyone for this machine's country. The crate reads no
@@ -34,6 +35,6 @@ pub use error::{Error, Failure, HostFailure};
 #[cfg(feature = "ip-lookup")]
 pub use hub::lookup_country;
 pub use hub::{
-    Endpoints, Host, MIRROR, ORIGIN, Reason, host_name, local_country, normalize_endpoint,
+    Endpoints, Host, HubFile, MIRROR, ORIGIN, Reason, host_name, local_country, normalize_endpoint,
     system_time_zone,
 };
