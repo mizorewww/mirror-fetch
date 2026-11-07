@@ -3,6 +3,9 @@
 
 use crate::download::{Event, Phase, STALL, Transfer};
 use crate::error::{Failure, Stop};
+use crate::http::{self, Follow, Method};
+use crate::native::aria2_control;
+use crate::resume::{self, Validator};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -50,6 +53,34 @@ fn drain(stderr: std::process::ChildStderr) -> Arc<Mutex<Vec<String>>> {
     lines
 }
 
+/// The built-in client's rule, for a client that cannot send `If-Range`: a
+/// partial file is continued only if a `HEAD` shows the same validator it was
+/// started with, or if its hash will be checked. The current validator is kept
+/// for the next run.
+fn keep_or_discard(t: &Transfer) {
+    let agent = http::agent(t.route, Duration::from_secs(30));
+    let current = http::send(&agent, Method::Head, t.url, &[], None, Follow::All)
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| Validator::from_headers(t.url, response.headers()));
+    let have = std::fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
+    if have > 0 || aria2_control(t.part).exists() {
+        let stored = Validator::load(t.part).filter(|stored| stored.url == t.url);
+        let keep = match (&stored, &current) {
+            (Some(stored), Some(current)) => stored.same_resource(current),
+            _ => t.verified,
+        };
+        if !keep {
+            resume::discard(t.part);
+        } else if have > 0 {
+            t.spliced.set(true);
+        }
+    }
+    let kept = std::fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
+    t.progress.event(Event::Resumed { bytes: kept });
+    resume::record(t.part, current.as_ref());
+}
+
 pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     let unavailable = |error: &dyn std::fmt::Display| Stop::Aria2Unavailable(error.to_string());
     let dir = t
@@ -74,6 +105,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .route
         .aria2_options(t.url)
         .map_err(|reason| unavailable(&reason))?;
+    keep_or_discard(t);
     let mut conf = tempfile::NamedTempFile::new()?;
     writeln!(conf, "rpc-secret={secret}")?;
     for line in proxy {
@@ -246,7 +278,6 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
 mod tests {
     use super::*;
     use crate::hub::Host;
-    use crate::native::aria2_control;
     use crate::proxy::{DIRECT, Route};
 
     #[test]
@@ -260,6 +291,8 @@ mod tests {
             part: &part,
             size: Some(5),
             bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
             connections: 8,
             cancel: &(),
             progress: &(),
@@ -297,7 +330,9 @@ mod tests {
                 }
             }
         }
+        // The HEAD that looks for a validator, then aria2's GET.
         let (base, _server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".into(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
         ]);
         let root = tempfile::tempdir().unwrap();
@@ -311,6 +346,8 @@ mod tests {
             part: &part,
             size: Some(5),
             bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
             connections: 8,
             cancel: &(),
             progress: &last,
@@ -331,6 +368,7 @@ mod tests {
             return;
         }
         let (proxy, server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".into(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
         ]);
         let route = Route::new(Some(ureq::Proxy::new(&proxy).unwrap()), None);
@@ -343,6 +381,8 @@ mod tests {
             part: &part,
             size: Some(5),
             bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
             connections: 8,
             cancel: &(),
             progress: &(),
@@ -350,10 +390,12 @@ mod tests {
         };
         run(program, &transfer).unwrap();
         let heads = server.join().unwrap();
+        // heads[0] is the built-in client's HEAD, tunnelled with CONNECT.
+        assert!(heads[0].contains("models.invalid"), "{}", heads[0]);
         assert!(
-            heads[0].starts_with("GET http://models.invalid/r/resolve/main/f "),
+            heads[1].starts_with("GET http://models.invalid/r/resolve/main/f "),
             "{}",
-            heads[0]
+            heads[1]
         );
         assert_eq!(std::fs::read(&part).unwrap(), b"12345");
     }

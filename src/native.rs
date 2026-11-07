@@ -2,7 +2,8 @@
 
 use crate::download::{Event, Phase, STALL, Transfer};
 use crate::error::{Failure, Stop, is_permanent_status};
-use crate::http::{self, Follow};
+use crate::http::{self, Follow, Method};
+use crate::resume::{self, Validator};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -23,26 +24,38 @@ pub(crate) fn aria2_control(part: &std::path::Path) -> PathBuf {
 }
 
 pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
-    let control = aria2_control(t.part);
-    if control.exists() {
-        let _ = fs::remove_file(t.part);
-        let _ = fs::remove_file(control);
+    if aria2_control(t.part).exists() {
+        resume::discard(t.part);
     }
     // Hosts hand large files to a CDN, so downloads follow redirects; a token
     // follows only those that stay on the mirror's origin.
     let agent = http::agent(t.route, STALL);
     let mut idle = 0;
     let mut phase = Phase::Connect;
+    // Whether this call has written the partial file from this mirror.
+    let mut own = false;
     loop {
         t.check()?;
-        let have = fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
+        let mut have = fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
+        let validator = (have > 0)
+            .then(|| Validator::load(t.part))
+            .flatten()
+            .filter(|validator| validator.url == t.url);
+        if have > 0 && !own && validator.is_none() && !t.verified {
+            // Bytes from an earlier run or another mirror, with no hash to catch a
+            // splice and nothing to show they belong to this file: start over.
+            resume::discard(t.part);
+            have = 0;
+        }
         if let Some(size) = t.size {
-            if have == size {
+            // A whole file not written here is checked with the server first, unless
+            // its hash will be.
+            if have == size && (own || t.verified) {
                 return Ok(());
             }
             if have > size {
                 // More than expected: start over, but not forever.
-                fs::remove_file(t.part)?;
+                resume::discard(t.part);
                 idle += 1;
                 if idle >= IDLE_ATTEMPTS {
                     return Err(Failure::Incomplete {
@@ -56,7 +69,8 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         }
         t.progress.event(Event::Resumed { bytes: have });
         t.phase(phase);
-        let result = attempt(&agent, t, have);
+        let if_range = validator.as_ref().map(Validator::if_range);
+        let result = attempt(&agent, t, have, if_range, &mut own);
         let after = fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
         match result {
             Ok(()) => return Ok(()),
@@ -145,7 +159,13 @@ fn content_range(response: &ureq::http::Response<ureq::Body>) -> (Option<u64>, O
 }
 
 /// One request from byte `have`, appending to the partial file.
-fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
+fn attempt(
+    agent: &ureq::Agent,
+    t: &Transfer,
+    have: u64,
+    if_range: Option<&str>,
+    own: &mut bool,
+) -> Result<(), Stop> {
     t.progress.event(Event::Request {
         url: t.url,
         from: have,
@@ -153,13 +173,22 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
     let mut headers = Vec::new();
     if have > 0 {
         headers.push(("Range", format!("bytes={have}-")));
+        if let Some(validator) = if_range {
+            // A changed file comes back whole, with 200, instead of as a range.
+            headers.push(("If-Range", validator.to_owned()));
+        }
     }
-    let mut response =
-        http::send(agent, t.url, &headers, t.bearer, Follow::All).map_err(Failure::Request)?;
+    let mut response = http::send(agent, Method::Get, t.url, &headers, t.bearer, Follow::All)
+        .map_err(Failure::Request)?;
     let code = response.status().as_u16();
     if code != 200 && code != 206 {
-        // Without an expected size, a range past the end may mean the file is whole.
-        if code == 416 && have > 0 && t.size.is_none() && content_range(&response).1 == Some(have) {
+        // A range past the end of a file of exactly this length: it is whole.
+        if code == 416
+            && have > 0
+            && t.size.is_none_or(|size| size == have)
+            && content_range(&response).1 == Some(have)
+        {
+            *own = true;
             return Ok(());
         }
         // The server's error page or JSON usually names the cause.
@@ -167,7 +196,7 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
         let n = body.chars().count();
         let tail: String = body.chars().skip(n.saturating_sub(200)).collect();
         if code == 416 && have > 0 {
-            fs::remove_file(t.part)?;
+            resume::discard(t.part);
         }
         return Err(Failure::Status { code, body: tail }.into());
     }
@@ -176,7 +205,7 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
     if resumed && start != Some(have) {
         // The bytes would land in the wrong place, or nobody says where they go:
         // start this file over.
-        fs::remove_file(t.part)?;
+        resume::discard(t.part);
         return Err(Failure::Request(match start {
             Some(start) => format!("asked for bytes from {have}, got them from {start}"),
             None => {
@@ -199,6 +228,12 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
             received: announced,
         }));
     }
+    if !resumed {
+        resume::record(
+            t.part,
+            Validator::from_headers(t.url, response.headers()).as_ref(),
+        );
+    }
     let total = t.size.or(announced);
     let mut done = if resumed { have } else { 0 };
     let mut out = if done > 0 {
@@ -206,6 +241,10 @@ fn attempt(agent: &ureq::Agent, t: &Transfer, have: u64) -> Result<(), Stop> {
     } else {
         fs::File::create(t.part)?
     };
+    *own = true;
+    if resumed {
+        t.spliced.set(true);
+    }
     t.phase(Phase::Download);
     if let Some(total) = total {
         t.progress.length(total);
@@ -260,6 +299,8 @@ mod tests {
             part,
             size,
             bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
             connections: 1,
             cancel: &(),
             progress: &(),

@@ -3,6 +3,8 @@
 use crate::error::{Error, Failure, HostFailure, Stop};
 use crate::hub::Host;
 use crate::proxy::Route;
+use crate::resume;
+use std::cell::Cell;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -230,6 +232,10 @@ pub(crate) struct Transfer<'a> {
     /// The expected length, if known.
     pub size: Option<u64>,
     pub bearer: Option<&'a str>,
+    /// A SHA-256 will be checked, so a resume may splice: a mismatch is caught.
+    pub verified: bool,
+    /// Set when the file was continued rather than written in one piece.
+    pub spliced: &'a Cell<bool>,
     pub connections: u32,
     pub cancel: &'a dyn Cancel,
     pub progress: &'a dyn Progress,
@@ -307,6 +313,13 @@ impl Downloader {
     /// (`model.gguf.part`). Each mirror is tried in turn; one whose bytes fail
     /// the size or SHA-256 is given up on and its bytes discarded. `dest` is
     /// replaced only by a complete, verified file. Its directory is created.
+    ///
+    /// A partial file is continued only when its bytes are known to be this
+    /// file's: with the ETag or Last-Modified it was started with (kept in
+    /// `.part.meta` and sent as `If-Range`, so a changed file comes back whole),
+    /// or when a SHA-256 will catch a bad join. Without a hash, a partial file
+    /// is never carried from one mirror to the next. With one, a joined file
+    /// that fails it is fetched once more from byte 0 on the same mirror.
     pub fn download(
         &self,
         target: &Target,
@@ -374,39 +387,58 @@ impl Downloader {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
         let mut failures = Vec::new();
-        for mirror in mirrors {
+        let verified = expect.sha256.is_some();
+        for (index, mirror) in mirrors.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            if index > 0 && !verified {
+                // Without a hash, nothing would catch one mirror's bytes continued
+                // with another's.
+                resume::discard(part);
+            }
             let host = &mirror.host;
-            let transfer = Transfer {
-                url: &mirror.url,
-                host,
-                part,
-                size: expect.size,
-                bearer: mirror.bearer.as_deref(),
-                connections: self.connections,
-                cancel,
-                progress,
-                route: &self.route,
-            };
-            let failure = match self.transfer(&transfer) {
-                Ok(()) => match check(part, expect, cancel, progress) {
-                    Ok(None) => {
-                        fs::rename(part, dest).map_err(Error::Io)?;
-                        placed();
-                        progress.event(Event::Completed { host });
-                        return Ok(());
-                    }
-                    Ok(Some(failure)) => {
-                        let _ = fs::remove_file(part);
-                        failure
-                    }
-                    Err(Stop::Failed(Failure::Io(error))) => return Err(Error::Io(error)),
+            let mut fresh_retry = false;
+            let failure = loop {
+                let spliced = Cell::new(false);
+                let transfer = Transfer {
+                    url: &mirror.url,
+                    host,
+                    part,
+                    size: expect.size,
+                    bearer: mirror.bearer.as_deref(),
+                    verified,
+                    spliced: &spliced,
+                    connections: self.connections,
+                    cancel,
+                    progress,
+                    route: &self.route,
+                };
+                break match self.transfer(&transfer) {
+                    Ok(()) => match check(part, expect, cancel, progress) {
+                        Ok(None) => {
+                            fs::rename(part, dest).map_err(Error::Io)?;
+                            resume::forget(part);
+                            placed();
+                            progress.event(Event::Completed { host });
+                            return Ok(());
+                        }
+                        Ok(Some(failure)) => {
+                            resume::discard(part);
+                            if spliced.get() && !fresh_retry {
+                                // The bytes may be wrong only where they were joined:
+                                // this mirror gets one try from byte 0.
+                                fresh_retry = true;
+                                continue;
+                            }
+                            failure
+                        }
+                        Err(Stop::Failed(Failure::Io(error))) => return Err(Error::Io(error)),
+                        Err(_) => return Err(Error::Cancelled),
+                    },
+                    Err(Stop::Failed(failure)) => failure,
                     Err(_) => return Err(Error::Cancelled),
-                },
-                Err(Stop::Failed(failure)) => failure,
-                Err(_) => return Err(Error::Cancelled),
+                };
             };
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -631,6 +663,11 @@ pub(crate) mod test_support {
             data.push(byte[0]);
         }
         String::from_utf8_lossy(&data).into_owned()
+    }
+
+    /// A splice flag for a test transfer.
+    pub fn spliced() -> &'static std::cell::Cell<bool> {
+        Box::leak(Box::new(std::cell::Cell::new(false)))
     }
 
     pub fn sha256(body: &[u8]) -> String {

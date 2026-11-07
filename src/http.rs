@@ -33,6 +33,13 @@ pub(crate) enum Follow {
     SameOrigin,
 }
 
+/// `GET` or `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Method {
+    Get,
+    Head,
+}
+
 /// Same scheme, host and port.
 pub(crate) fn same_origin(a: &url::Url, b: &url::Url) -> bool {
     a.scheme() == b.scheme()
@@ -44,6 +51,7 @@ pub(crate) fn same_origin(a: &url::Url, b: &url::Url) -> bool {
 /// first URL's origin: once a redirect leaves it, the token is gone for good.
 pub(crate) fn send(
     agent: &ureq::Agent,
+    method: Method,
     url: &str,
     headers: &[(&str, String)],
     bearer: Option<&str>,
@@ -52,7 +60,10 @@ pub(crate) fn send(
     let mut current = url::Url::parse(url).map_err(|error| format!("{url}: {error}"))?;
     let mut bearer = bearer;
     for _ in 0..=MAX_REDIRECTS {
-        let mut request = agent.get(current.as_str());
+        let mut request = match method {
+            Method::Get => agent.get(current.as_str()),
+            Method::Head => agent.head(current.as_str()),
+        };
         for (name, value) in headers {
             request = request.header(*name, value);
         }

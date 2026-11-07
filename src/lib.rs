@@ -28,6 +28,7 @@ mod http;
 mod hub;
 mod native;
 mod proxy;
+mod resume;
 
 pub use download::{
     Cancel, DEFAULT_CONNECTIONS, Downloader, Event, MAX_CONNECTIONS, Mirror, Phase, Progress,

@@ -23,6 +23,10 @@ pub struct Body {
     slow: Option<(usize, Duration)>,
     /// No `Content-Length`: the body ends when the connection closes.
     no_length: bool,
+    /// Sent as `ETag`; an `If-Range` that differs gets the whole body.
+    etag: Option<String>,
+    /// The status every request with a `Range` gets instead of bytes.
+    range_status: Option<u16>,
 }
 
 impl Body {
@@ -67,6 +71,16 @@ impl Body {
         self.no_length = true;
         self
     }
+
+    pub fn with_etag(mut self, etag: &str) -> Self {
+        self.etag = Some(etag.to_owned());
+        self
+    }
+
+    pub fn refusing_ranges(mut self, code: u16) -> Self {
+        self.range_status = Some(code);
+        self
+    }
 }
 
 /// One request as the server saw it.
@@ -77,6 +91,7 @@ pub struct Request {
     /// The `N` of `Range: bytes=N-` or `bytes=N-M`.
     pub range: Option<u64>,
     pub authorization: Option<String>,
+    pub if_range: Option<String>,
     pub via_proxy: bool,
 }
 
@@ -163,6 +178,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
     let mut range = None;
     let mut range_end: Option<u64> = None;
     let mut authorization = None;
+    let mut if_range = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -179,6 +195,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
                 }
             }
             "authorization" => authorization = Some(value.trim().to_owned()),
+            "if-range" => if_range = Some(value.trim().to_owned()),
             _ => {}
         }
     }
@@ -189,6 +206,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
             path: path.clone(),
             range,
             authorization,
+            if_range: if_range.clone(),
             via_proxy,
         });
         let body = state.routes.get(&path).cloned();
@@ -222,6 +240,18 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
         );
         return;
     }
+    if let (Some(code), Some(_)) = (body.range_status, range) {
+        let _ = stream.write_all(
+            format!("HTTP/1.1 {code} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        return;
+    }
+    // A range is honoured only for the version the client already has.
+    if if_range.is_some() && if_range != body.etag {
+        range = None;
+        range_end = None;
+    }
     let len = body.data.len() as u64;
     let start = range.unwrap_or(0);
     if range.is_some() && start >= len {
@@ -242,6 +272,9 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
     };
     if !body.no_length {
         head.push_str(&format!("Content-Length: {}\r\n", slice.len()));
+    }
+    if let Some(etag) = &body.etag {
+        head.push_str(&format!("ETag: {etag}\r\n"));
     }
     head.push_str("Connection: close\r\n\r\n");
     if stream.write_all(head.as_bytes()).is_err() || method == "HEAD" {
