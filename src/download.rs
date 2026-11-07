@@ -575,11 +575,42 @@ fn locking(result: Result<(), fs::TryLockError>, part: &Path) -> std::io::Result
     match result {
         Ok(()) => Ok(true),
         Err(fs::TryLockError::WouldBlock) => Err(busy(part)),
-        Err(fs::TryLockError::Error(error)) if error.kind() == std::io::ErrorKind::Unsupported => {
+        Err(fs::TryLockError::Error(error))
+            if error.kind() == std::io::ErrorKind::Unsupported || no_locks(&error) =>
+        {
             Ok(false)
         }
         Err(fs::TryLockError::Error(error)) => Err(error),
     }
+}
+
+/// `ENOLCK`: the system has no locks to give, as on Linux NFS without lockd.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ENOLCK: Option<i32> = Some(37);
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const ENOLCK: Option<i32> = Some(77);
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+const ENOLCK: Option<i32> = None;
+
+/// Whether `error` says locks are unavailable here, rather than refused.
+fn no_locks(error: &std::io::Error) -> bool {
+    ENOLCK.is_some() && error.raw_os_error() == ENOLCK
 }
 
 /// On Windows, a lock file that its finishing owner has just removed stays
@@ -1094,6 +1125,20 @@ mod tests {
             opening(denied(), part, false, true).kind(),
             ErrorKind::PermissionDenied
         );
+    }
+
+    /// ENOLCK (Linux NFS without lockd) means no locks exist here: go ahead
+    /// without one, as for Unsupported.
+    #[test]
+    fn no_locks_available_lets_the_download_go_ahead() {
+        let part = Path::new("f.part");
+        if let Some(code) = ENOLCK {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(!locking(Err(fs::TryLockError::Error(error)), part).unwrap());
+        }
+        // Another OS error is still an error.
+        let other = std::io::Error::from_raw_os_error(5);
+        assert!(locking(Err(fs::TryLockError::Error(other)), part).is_err());
     }
 
     /// A denied open with no lock file there is the directory refusing: that
