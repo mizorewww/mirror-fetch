@@ -83,10 +83,7 @@ fn keep_or_discard(t: &Transfer) {
 
 pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     let unavailable = |error: &dyn std::fmt::Display| Stop::Aria2Unavailable(error.to_string());
-    let dir = t
-        .part
-        .parent()
-        .ok_or_else(|| unavailable(&"no directory"))?;
+    let dir = directory(t.part).ok_or_else(|| unavailable(&"no directory"))?;
     let out = t
         .part
         .file_name()
@@ -106,6 +103,8 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .aria2_options(t.url)
         .map_err(|reason| unavailable(&reason))?;
     keep_or_discard(t);
+    // Removed once aria2 has read it (when it first answers), so a forced exit
+    // later leaves no secret behind; dropping it removes it on every other path.
     let mut conf = tempfile::NamedTempFile::new()?;
     writeln!(conf, "rpc-secret={secret}")?;
     for line in proxy {
@@ -148,6 +147,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .stderr(Stdio::piped());
     let mut child = Kill(command.spawn().map_err(|error| unavailable(&error))?);
     let stderr = child.0.stderr.take().map(drain);
+    let mut conf = Some(conf);
     let tail = || {
         stderr
             .as_ref()
@@ -223,6 +223,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             Err(error) => return Err(Failure::Aria2Rpc(error).into()),
         };
         answered = true;
+        drop(conf.take());
         let completed: u64 = status["completedLength"]
             .as_str()
             .and_then(|value| value.parse().ok())
@@ -254,7 +255,8 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
                 while Instant::now() < deadline && !matches!(child.0.try_wait(), Ok(Some(_))) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                return Ok(());
+                let control = aria2_control(t.part).exists();
+                return completion(completed, total, control).map_err(Stop::from);
             }
             "error" | "removed" => {
                 return Err(Failure::Aria2 {
@@ -272,6 +274,34 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             return Err(Failure::Stalled.into());
         }
     }
+}
+
+/// The directory aria2 writes into: `.` for a bare file name.
+fn directory(part: &Path) -> Option<&Path> {
+    let dir = part.parent()?;
+    Some(if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    })
+}
+
+/// Whether aria2's "complete" holds: every byte it knows of arrived, and its
+/// control file, which it removes only when the file is whole, is gone.
+fn completion(completed: u64, total: u64, control: bool) -> Result<(), Failure> {
+    if total > 0 && completed != total {
+        return Err(Failure::Incomplete {
+            expected: total,
+            received: completed,
+        });
+    }
+    if control {
+        return Err(Failure::Aria2 {
+            code: "-".into(),
+            message: "reported complete but kept its control file".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -302,6 +332,26 @@ mod tests {
             run(&root.path().join("no-such-aria2c"), &transfer),
             Err(Stop::Aria2Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn complete_means_every_byte_and_no_control_file() {
+        assert!(completion(5, 5, false).is_ok());
+        assert!(completion(5, 0, false).is_ok());
+        assert!(matches!(
+            completion(3, 5, false),
+            Err(Failure::Incomplete {
+                expected: 5,
+                received: 3
+            })
+        ));
+        assert!(matches!(completion(5, 5, true), Err(Failure::Aria2 { .. })));
+    }
+
+    #[test]
+    fn a_bare_name_is_written_here() {
+        assert_eq!(directory(Path::new("f.part")), Some(Path::new(".")));
+        assert_eq!(directory(Path::new("a/f.part")), Some(Path::new("a")));
     }
 
     #[test]
