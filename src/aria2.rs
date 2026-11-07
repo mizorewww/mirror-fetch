@@ -53,16 +53,20 @@ fn drain(stderr: std::process::ChildStderr) -> Arc<Mutex<Vec<String>>> {
     lines
 }
 
+/// How long the validator HEAD may take before aria2 starts without it.
+const PROBE: Duration = Duration::from_secs(10);
+
 /// The built-in client's rule, for a client that cannot send `If-Range`: a
 /// partial file is continued only if a `HEAD` shows the same validator it was
 /// started with, or if its hash will be checked. The current validator is kept
 /// for the next run.
-fn keep_or_discard(t: &Transfer) {
-    let agent = http::agent(t.route, Duration::from_secs(30));
-    let current = http::send(&agent, Method::Head, t.url, &[], None, Follow::All)
-        .ok()
-        .filter(|response| response.status().is_success())
-        .and_then(|response| Validator::from_headers(t.url, response.headers()));
+///
+/// Between this `HEAD` and aria2's first `GET` the file could change; aria2
+/// would then continue old bytes with new ones. That gap is a fraction of a
+/// second, against the hours a partial file may wait; a hash, when given,
+/// still catches it.
+fn keep_or_discard(t: &Transfer) -> Result<(), Stop> {
+    let current = probe(t)?;
     let have = std::fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
     if have > 0 || aria2_control(t.part).exists() {
         let stored = Validator::load(t.part).filter(|stored| stored.url == t.url);
@@ -79,6 +83,31 @@ fn keep_or_discard(t: &Transfer) {
     let kept = std::fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
     t.progress.event(Event::Resumed { bytes: kept });
     resume::record(t.part, current.as_ref());
+    Ok(())
+}
+
+/// The current validator, from a `HEAD` bounded by [`PROBE`] and given up as
+/// soon as the transfer is cancelled; `None` when the server gives none in time.
+fn probe(t: &Transfer) -> Result<Option<Validator>, Stop> {
+    let route = t.route.clone();
+    let url = t.url.to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let agent = http::agent(&route, PROBE, Some(PROBE));
+        let found = http::send(&agent, Method::Head, &url, &[], None, Follow::All)
+            .ok()
+            .filter(|response| response.status().is_success())
+            .and_then(|response| Validator::from_headers(&url, response.headers()));
+        let _ = sender.send(found);
+    });
+    loop {
+        t.check()?;
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(found) => return Ok(found),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
 }
 
 pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
@@ -102,7 +131,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .route
         .aria2_options(t.url)
         .map_err(|reason| unavailable(&reason))?;
-    keep_or_discard(t);
+    keep_or_discard(t)?;
     // Removed once aria2 has read it (when it first answers), so a forced exit
     // later leaves no secret behind; dropping it removes it on every other path.
     let mut conf = tempfile::NamedTempFile::new()?;

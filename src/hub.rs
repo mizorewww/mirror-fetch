@@ -278,7 +278,11 @@ impl Downloader {
     /// the hub's own headers are read before any CDN's. A token is sent as for the
     /// download. [`Error::AllHostsFailed`] when no hub says anything useful.
     pub fn hub_metadata(&self, mirrors: &[Mirror]) -> Result<HubMetadata, Error> {
-        let agent = http::agent(self.route(), Duration::from_secs(30));
+        let agent = http::agent(
+            self.route(),
+            Duration::from_secs(15),
+            Some(Duration::from_secs(30)),
+        );
         let mut failures = Vec::new();
         for mirror in mirrors {
             let failure = match http::send(

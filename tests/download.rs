@@ -262,3 +262,36 @@ fn aria2_downloads_through_the_same_mirrors() {
         server.requests()
     );
 }
+
+/// The HEAD that looks for a validator before aria2 runs stops with the
+/// download: a server that never answers it cannot hold a cancel up. (The
+/// program need not exist: the HEAD comes first.)
+#[test]
+fn cancelling_during_the_validator_head_returns_promptly() {
+    let server = Server::start();
+    server.serve("/f", Body::bytes(b"data").with_silent_head());
+    let root = tempfile::tempdir().unwrap();
+    let cancel = AtomicBool::new(false);
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            cancel.store(true, Ordering::Relaxed);
+        });
+        let error = Downloader::default()
+            .with_aria2(Some(root.path().join("no-such-aria2c")))
+            .download(
+                &Target::new([server.url("/f")]),
+                &root.path().join("f"),
+                &cancel,
+                &(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::Cancelled), "{error:?}");
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}

@@ -10,9 +10,11 @@ pub(crate) const USER_AGENT: &str = concat!("model-fetch/", env!("CARGO_PKG_VERS
 const MAX_REDIRECTS: usize = 5;
 
 /// An agent that returns redirects instead of following them, never re-encodes
-/// bytes, and reports error statuses as responses.
-pub(crate) fn agent(route: &Route, per_read: Duration) -> ureq::Agent {
+/// bytes, and reports error statuses as responses. `whole` bounds each request
+/// from start to end, for requests that must not hang.
+pub(crate) fn agent(route: &Route, per_read: Duration, whole: Option<Duration>) -> ureq::Agent {
     ureq::Agent::config_builder()
+        .timeout_global(whole)
         .proxy(route.proxy())
         .max_redirects(0)
         .max_redirects_will_error(false)

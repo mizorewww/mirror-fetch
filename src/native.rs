@@ -29,7 +29,7 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
     }
     // Hosts hand large files to a CDN, so downloads follow redirects; a token
     // follows only those that stay on the mirror's origin.
-    let agent = http::agent(t.route, STALL);
+    let agent = http::agent(t.route, STALL, None);
     let mut idle = 0;
     let mut phase = Phase::Connect;
     // Whether this call has written the partial file from this mirror.

@@ -33,6 +33,8 @@ pub struct Body {
     no_head: bool,
     /// Ranges are served whatever `If-Range` says.
     ignore_if_range: bool,
+    /// `HEAD` is never answered.
+    silent_head: bool,
 }
 
 impl Body {
@@ -85,6 +87,11 @@ impl Body {
 
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub fn with_silent_head(mut self) -> Self {
+        self.silent_head = true;
         self
     }
 
@@ -251,6 +258,10 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect();
+    if body.silent_head && method == "HEAD" {
+        std::thread::sleep(Duration::from_secs(30));
+        return;
+    }
     if body.no_head && method == "HEAD" {
         let _ = stream.write_all(
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
