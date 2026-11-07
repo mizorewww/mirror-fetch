@@ -386,6 +386,8 @@ impl Downloader {
         if let Some(parent) = dest.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
+        // Two runs writing one partial file would interleave their bytes.
+        let _lock = Lock::acquire(part).map_err(Error::Io)?;
         let mut failures = Vec::new();
         let verified = expect.sha256.is_some();
         for (index, mirror) in mirrors.iter().enumerate() {
@@ -475,6 +477,71 @@ impl Downloader {
         }
         crate::native::run(transfer)
     }
+}
+
+/// An exclusive lock on `<part>.lock`, held while one download owns the partial
+/// file; the lock file is removed when it is released.
+struct Lock {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl Lock {
+    fn acquire(part: &Path) -> std::io::Result<Self> {
+        let mut name = part.as_os_str().to_owned();
+        name.push(".lock");
+        let path = PathBuf::from(name);
+        for _ in 0..5 {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)?;
+            match file.try_lock() {
+                // A run that just finished may have removed the file this handle
+                // locks; then others would lock a new one, so try again.
+                Ok(()) if is_at(&file, &path) => {
+                    return Ok(Self { path, _file: file });
+                }
+                Ok(()) => continue,
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!("another download is writing {}", part.display()),
+                    ));
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "could not lock {}",
+            path.display()
+        )))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Removed while still held, so no one can lock this file after it is gone.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Whether `file` is still the file at `path`.
+#[cfg(unix)]
+fn is_at(file: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+/// Windows does not let a new file take the name while a removed one is open,
+/// so the name still existing is enough.
+#[cfg(not(unix))]
+fn is_at(_file: &fs::File, path: &Path) -> bool {
+    path.exists()
 }
 
 /// What the bytes must be.

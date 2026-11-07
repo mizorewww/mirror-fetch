@@ -2,6 +2,8 @@
 name = "model-fetch"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock, for one download per destination.
+rust-version = "1.89"
 license = "MIT"
 description = "Resumable, verified downloads from ordered mirrors, with a Hugging Face layer and a CLI"
 repository = "https://github.com/mizorewww/model-fetch"
