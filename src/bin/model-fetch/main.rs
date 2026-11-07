@@ -437,16 +437,10 @@ fn run_hf(hf: Hf) -> Outcome {
         // The Hub's size and hash, at the commit the revision names, so a branch
         // that moves meanwhile cannot mix two versions.
         let target = match downloader.hub_metadata(&mirrors) {
-            Ok(metadata) => {
-                let pinned = match &metadata.commit {
-                    Some(commit) => file.at(commit),
-                    None => file,
-                };
-                match pinned.target(&hosts, token.as_deref()) {
-                    Ok(target) => metadata.apply(target),
-                    Err(reason) => return usage(reason),
-                }
-            }
+            Ok(metadata) => match metadata.target(&file, &hosts, token.as_deref()) {
+                Ok(target) => target,
+                Err(reason) => return usage(reason),
+            },
             Err(reason) => {
                 if !hf.transfer.quiet {
                     let why = match &reason {

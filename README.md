@@ -177,13 +177,12 @@ let file = HubFile::new("org/model", "onnx/model.onnx").at("v1.0");
 // A repository, revision or file with a `..` segment is refused.
 let mirrors = file.mirrors(&hosts, token.as_deref()).expect("a plain path");
 let downloader = Downloader::default();
-// The Hub's size and SHA-256 (or Git blob hash), and the commit to fetch at.
+// The Hub's size and SHA-256 (or Git blob hash), and the commit to fetch at;
+// each host is asked at the commit, then at the revision.
 let metadata = downloader.hub_metadata(&mirrors)?;
-let pinned = match &metadata.commit {
-    Some(commit) => file.at(commit),
-    None => file,
-};
-let target = metadata.apply(pinned.target(&hosts, token.as_deref()).expect("a plain path"));
+let target = metadata
+    .target(&file, &hosts, token.as_deref())
+    .expect("a plain path");
 downloader.download(&target, Path::new("models/model.onnx"), &(), &())?;
 # Ok::<(), model_fetch::Error>(())
 ```

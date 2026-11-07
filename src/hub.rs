@@ -223,6 +223,36 @@ impl HubMetadata {
         target
     }
 
+    /// `file` at the commit, with this size and hash. Each host is asked for
+    /// the file at the commit first, then at `file`'s own revision, in case it
+    /// cannot serve a commit (a mirror that knows only branch names).
+    pub fn target(
+        &self,
+        file: &HubFile<'_>,
+        hosts: &[Host],
+        token: Option<&str>,
+    ) -> Result<Target, InvalidHubPath> {
+        let original = file.mirrors(hosts, token)?;
+        let mirrors = match self
+            .commit
+            .as_deref()
+            .filter(|commit| *commit != file.revision)
+        {
+            Some(commit) => file
+                .at(commit)
+                .mirrors(hosts, token)?
+                .into_iter()
+                .zip(original)
+                .flat_map(|(pinned, named)| [pinned, named])
+                .collect(),
+            None => original,
+        };
+        Ok(self.apply(Target {
+            mirrors,
+            ..Target::default()
+        }))
+    }
+
     fn from_headers(host: &Host, code: u16, headers: &ureq::http::HeaderMap) -> Option<Self> {
         let text = |name: &str| {
             headers

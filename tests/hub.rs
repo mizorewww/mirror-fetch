@@ -119,3 +119,47 @@ fn no_metadata_is_an_error_naming_each_host() {
     let error = Downloader::default().hub_metadata(&mirrors).unwrap_err();
     assert!(error.to_string().contains("HTTP 405"), "{error}");
 }
+
+/// A mirror that cannot serve the file at the commit is asked again at the
+/// revision before the next host.
+#[test]
+fn a_host_without_the_commit_is_asked_at_the_revision() {
+    let data = common::payload(10_000);
+    let hub = Server::start();
+    hub.serve(
+        "/org/model/resolve/main/w.bin",
+        Body::bytes(&data)
+            .with_header("X-Linked-Etag", &format!("\"{}\"", sha256(&data)))
+            .with_header("X-Repo-Commit", COMMIT),
+    );
+    let hosts = [Host::Hub(hub.base())];
+    let file = HubFile::new("org/model", "w.bin");
+    let downloader = Downloader::default();
+    let metadata = downloader
+        .hub_metadata(&file.mirrors(&hosts, None).unwrap())
+        .unwrap();
+    let target = metadata.target(&file, &hosts, None).unwrap();
+    let urls: Vec<&str> = target.mirrors.iter().map(|m| m.url()).collect();
+    assert_eq!(urls.len(), 2);
+    assert!(
+        urls[0].contains(COMMIT) && urls[1].contains("/resolve/main/"),
+        "{urls:?}"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let dest = root.path().join("w.bin");
+    downloader.download(&target, &dest, &(), &()).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), data);
+    let gets: Vec<String> = hub
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "GET")
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(
+        gets,
+        [
+            format!("/org/model/resolve/{COMMIT}/w.bin"),
+            "/org/model/resolve/main/w.bin".to_owned()
+        ]
+    );
+}
