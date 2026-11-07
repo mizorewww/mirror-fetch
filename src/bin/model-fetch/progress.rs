@@ -27,6 +27,8 @@ pub struct Printer {
     quiet: bool,
     /// How many mirrors will be tried: after the last fails there is no next.
     mirrors: usize,
+    /// What the verify phase computes: `sha256` or `git hash`.
+    hash: &'static str,
     state: Mutex<State>,
 }
 
@@ -51,6 +53,7 @@ impl Printer {
             tty: std::io::stderr().is_terminal(),
             quiet,
             mirrors: 0,
+            hash: "sha256",
             state: Mutex::new(State {
                 phase: None,
                 host: String::new(),
@@ -72,6 +75,12 @@ impl Printer {
         {
             let _ = write!(std::io::stderr(), "\r\x1b[2K");
         }
+    }
+
+    /// Names the hash being checked as Git's blob hash.
+    pub fn git_hash(mut self, git: bool) -> Self {
+        self.hash = if git { "git hash" } else { "sha256" };
+        self
     }
 
     pub fn mirrors(mut self, mirrors: usize) -> Self {
@@ -105,7 +114,11 @@ impl Printer {
             Some(Phase::Connect) => format!("{label}: connecting to {host}..."),
             Some(Phase::Retry) => format!("{label}: reconnecting to {host}..."),
             Some(Phase::Verify) => {
-                format!("{label}: checking sha256  {}", percent(state.position))
+                format!(
+                    "{label}: checking {}  {}",
+                    self.hash,
+                    percent(state.position)
+                )
             }
             Some(Phase::Download) | None => {
                 let done = human_bytes(state.position);
@@ -185,7 +198,7 @@ impl Progress for Printer {
                         Phase::Download => {
                             format!("{}: downloading from {}", self.label, state.host)
                         }
-                        Phase::Verify => format!("{}: checking sha256", self.label),
+                        Phase::Verify => format!("{}: checking {}", self.label, self.hash),
                         _ => line,
                     };
                     self.say(&mut state, &line);

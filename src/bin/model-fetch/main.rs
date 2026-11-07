@@ -562,7 +562,8 @@ fn download(downloader: &Downloader, target: &Target, dest: &Path, quiet: bool) 
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| dest.display().to_string());
-    let printer = Printer::new(&label, quiet);
+    let printer =
+        Printer::new(&label, quiet).git_hash(target.sha256.is_none() && target.git_sha1.is_some());
     if dest.is_file() && target.has_hash() {
         match file_matches(dest, target, &CtrlC, &printer) {
             Ok(true) => {

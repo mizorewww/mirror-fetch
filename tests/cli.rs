@@ -349,6 +349,11 @@ fn hf_verifies_against_the_hub_and_skips_complete_files() {
         stderr.contains("config.json (3 B, git hash verified)"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("config.json: checking git hash"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("config.json: checking sha256"), "{stderr}");
     let gets: Vec<String> = hub
         .requests()
         .into_iter()
