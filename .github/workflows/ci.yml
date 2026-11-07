@@ -35,10 +35,24 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy, default features
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy, CLI
+        run: cargo clippy --all-targets --features cli -- -D warnings
       - name: Clippy, all features
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build, CLI
+        run: cargo build --features cli
+      - name: Library stays free of CLI dependencies
+        run: |
+          # Every library feature, every platform; only `cli` may bring these in.
+          tree=$(cargo tree --edges normal --prefix none --target all --features ip-lookup)
+          if grep -E '^(clap|clap_builder|clap_derive|ctrlc) ' <<<"$tree"; then
+            echo "the library depends on a CLI-only crate" >&2
+            exit 1
+          fi
       - name: Test, default features
         run: cargo test
+      - name: Test, CLI
+        run: cargo test --features cli
       - name: Test, all features
         run: cargo test --all-features
 

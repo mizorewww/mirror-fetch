@@ -3,6 +3,9 @@
 
 use crate::download::{Event, Phase, STALL, Transfer};
 use crate::error::{Failure, Stop};
+use crate::http::{self, Follow, Method};
+use crate::native::aria2_control;
+use crate::resume::{self, Validator};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -50,12 +53,66 @@ fn drain(stderr: std::process::ChildStderr) -> Arc<Mutex<Vec<String>>> {
     lines
 }
 
+/// How long the validator HEAD may take before aria2 starts without it.
+const PROBE: Duration = Duration::from_secs(10);
+
+/// The built-in client's rule, for a client that cannot send `If-Range`: a
+/// partial file is continued only if a `HEAD` shows the same validator it was
+/// started with, or if its hash will be checked. The current validator is kept
+/// for the next run.
+///
+/// Between this `HEAD` and aria2's first `GET` the file could change; aria2
+/// would then continue old bytes with new ones. That gap is a fraction of a
+/// second, against the hours a partial file may wait; a hash, when given,
+/// still catches it.
+fn keep_or_discard(t: &Transfer) -> Result<(), Stop> {
+    let current = probe(t)?;
+    let have = std::fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
+    if have > 0 || aria2_control(t.part).exists() {
+        let stored = Validator::load(t.part).filter(|stored| stored.url == t.url);
+        let keep = match (&stored, &current) {
+            (Some(stored), Some(current)) => stored.same_resource(current),
+            _ => t.verified,
+        };
+        if !keep {
+            resume::discard(t.part);
+        } else if have > 0 {
+            t.spliced.set(true);
+        }
+    }
+    let kept = std::fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
+    t.progress.event(Event::Resumed { bytes: kept });
+    resume::record(t.part, current.as_ref());
+    Ok(())
+}
+
+/// The current validator, from a `HEAD` bounded by [`PROBE`] and given up as
+/// soon as the transfer is cancelled; `None` when the server gives none in time.
+fn probe(t: &Transfer) -> Result<Option<Validator>, Stop> {
+    let route = t.route.clone();
+    let url = t.url.to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let agent = http::agent(&route, PROBE, Some(PROBE));
+        let found = http::send(&agent, Method::Head, &url, &[], None, Follow::All)
+            .ok()
+            .filter(|response| response.status().is_success())
+            .and_then(|response| Validator::from_headers(&url, response.headers()));
+        let _ = sender.send(found);
+    });
+    loop {
+        t.check()?;
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(found) => return Ok(found),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
 pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     let unavailable = |error: &dyn std::fmt::Display| Stop::Aria2Unavailable(error.to_string());
-    let dir = t
-        .part
-        .parent()
-        .ok_or_else(|| unavailable(&"no directory"))?;
+    let dir = directory(t.part).ok_or_else(|| unavailable(&"no directory"))?;
     let out = t
         .part
         .file_name()
@@ -74,6 +131,9 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .route
         .aria2_options(t.url)
         .map_err(|reason| unavailable(&reason))?;
+    keep_or_discard(t)?;
+    // Removed once aria2 has read it (when it first answers), so a forced exit
+    // later leaves no secret behind; dropping it removes it on every other path.
     let mut conf = tempfile::NamedTempFile::new()?;
     writeln!(conf, "rpc-secret={secret}")?;
     for line in proxy {
@@ -92,6 +152,8 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .arg(format!("--rpc-listen-port={port}"))
         .arg(format!("--stop-with-process={}", std::process::id()))
         .arg(format!("--gid={gid}"))
+        .arg(format!("--max-connection-per-server={}", t.connections))
+        .arg(format!("--split={}", t.connections))
         .arg("--dir")
         .arg(dir)
         .arg("--out")
@@ -101,8 +163,6 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             "--allow-overwrite=true",
             "--auto-file-renaming=false",
             "--file-allocation=none",
-            "--max-connection-per-server=8",
-            "--split=8",
             "--min-split-size=8M",
             "--connect-timeout=15",
             "--timeout=30",
@@ -116,6 +176,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
         .stderr(Stdio::piped());
     let mut child = Kill(command.spawn().map_err(|error| unavailable(&error))?);
     let stderr = child.0.stderr.take().map(drain);
+    let mut conf = Some(conf);
     let tail = || {
         stderr
             .as_ref()
@@ -157,6 +218,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     let mut answered = false;
     let mut downloading = false;
     let mut last = (0u64, Instant::now());
+    let mut length = 0u64;
     loop {
         std::thread::sleep(Duration::from_millis(500));
         t.check()?;
@@ -175,7 +237,13 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             "aria2.tellStatus",
             serde_json::json!([
                 gid,
-                ["status", "completedLength", "errorCode", "errorMessage"]
+                [
+                    "status",
+                    "completedLength",
+                    "totalLength",
+                    "errorCode",
+                    "errorMessage"
+                ]
             ]),
         ) {
             Ok(status) => status,
@@ -184,10 +252,19 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             Err(error) => return Err(Failure::Aria2Rpc(error).into()),
         };
         answered = true;
+        drop(conf.take());
         let completed: u64 = status["completedLength"]
             .as_str()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
+        let total: u64 = status["totalLength"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if total > 0 && total != length {
+            length = total;
+            t.progress.length(total);
+        }
         if completed != last.0 {
             last = (completed, Instant::now());
             if !downloading && completed > 0 {
@@ -207,7 +284,8 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
                 while Instant::now() < deadline && !matches!(child.0.try_wait(), Ok(Some(_))) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                return Ok(());
+                let control = aria2_control(t.part).exists();
+                return completion(completed, total, control).map_err(Stop::from);
             }
             "error" | "removed" => {
                 return Err(Failure::Aria2 {
@@ -227,12 +305,38 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
     }
 }
 
+/// The directory aria2 writes into: `.` for a bare file name.
+fn directory(part: &Path) -> Option<&Path> {
+    let dir = part.parent()?;
+    Some(if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    })
+}
+
+/// Whether aria2's "complete" holds: every byte it knows of arrived, and its
+/// control file, which it removes only when the file is whole, is gone.
+fn completion(completed: u64, total: u64, control: bool) -> Result<(), Failure> {
+    if total > 0 && completed != total {
+        return Err(Failure::Incomplete {
+            expected: total,
+            received: completed,
+        });
+    }
+    if control {
+        return Err(Failure::Aria2 {
+            code: "-".into(),
+            message: "reported complete but kept its control file".into(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::Remote;
     use crate::hub::Host;
-    use crate::native::aria2_control;
     use crate::proxy::{DIRECT, Route};
 
     #[test]
@@ -240,17 +344,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let part = root.path().join("file.part");
         let host = Host::Hub("http://127.0.0.1:1".into());
-        let remote = Remote {
-            repo: "r",
-            file: "f",
-            size: 1,
-            sha256: "",
-        };
         let transfer = Transfer {
             url: "http://127.0.0.1:1/f",
             host: &host,
             part: &part,
-            remote: &remote,
+            size: Some(5),
+            bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
+            connections: 8,
             cancel: &(),
             progress: &(),
             route: &DIRECT,
@@ -259,6 +361,26 @@ mod tests {
             run(&root.path().join("no-such-aria2c"), &transfer),
             Err(Stop::Aria2Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn complete_means_every_byte_and_no_control_file() {
+        assert!(completion(5, 5, false).is_ok());
+        assert!(completion(5, 0, false).is_ok());
+        assert!(matches!(
+            completion(3, 5, false),
+            Err(Failure::Incomplete {
+                expected: 5,
+                received: 3
+            })
+        ));
+        assert!(matches!(completion(5, 5, true), Err(Failure::Aria2 { .. })));
+    }
+
+    #[test]
+    fn a_bare_name_is_written_here() {
+        assert_eq!(directory(Path::new("f.part")), Some(Path::new(".")));
+        assert_eq!(directory(Path::new("a/f.part")), Some(Path::new("a")));
     }
 
     #[test]
@@ -273,7 +395,7 @@ mod tests {
     #[test]
     fn a_real_aria2_downloads_over_rpc_and_reports_bytes() {
         use crate::download::Progress;
-        use crate::download::test_support::{serve, sha256};
+        use crate::download::test_support::serve;
         let program = Path::new("aria2c");
         if Command::new(program).arg("--version").output().is_err() {
             return;
@@ -287,14 +409,9 @@ mod tests {
                 }
             }
         }
-        let hash = sha256(b"12345");
-        let remote = Remote {
-            repo: "r",
-            file: "f",
-            size: 5,
-            sha256: &hash,
-        };
+        // The HEAD that looks for a validator, then aria2's GET.
         let (base, _server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".into(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
         ]);
         let root = tempfile::tempdir().unwrap();
@@ -306,7 +423,11 @@ mod tests {
             url: &url,
             host: &host,
             part: &part,
-            remote: &remote,
+            size: Some(5),
+            bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
+            connections: 8,
             cancel: &(),
             progress: &last,
             route: &DIRECT,
@@ -320,19 +441,13 @@ mod tests {
     /// HTTP proxy for an `http://` file.
     #[test]
     fn a_real_aria2_uses_the_proxy() {
-        use crate::download::test_support::{serve, sha256};
+        use crate::download::test_support::serve;
         let program = Path::new("aria2c");
         if Command::new(program).arg("--version").output().is_err() {
             return;
         }
-        let hash = sha256(b"12345");
-        let remote = Remote {
-            repo: "r",
-            file: "f",
-            size: 5,
-            sha256: &hash,
-        };
         let (proxy, server) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".into(),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345".into(),
         ]);
         let route = Route::new(Some(ureq::Proxy::new(&proxy).unwrap()), None);
@@ -343,17 +458,23 @@ mod tests {
             url: "http://models.invalid/r/resolve/main/f",
             host: &host,
             part: &part,
-            remote: &remote,
+            size: Some(5),
+            bearer: None,
+            verified: true,
+            spliced: crate::download::test_support::spliced(),
+            connections: 8,
             cancel: &(),
             progress: &(),
             route: &route,
         };
         run(program, &transfer).unwrap();
         let heads = server.join().unwrap();
+        // heads[0] is the built-in client's HEAD, tunnelled with CONNECT.
+        assert!(heads[0].contains("models.invalid"), "{}", heads[0]);
         assert!(
-            heads[0].starts_with("GET http://models.invalid/r/resolve/main/f "),
+            heads[1].starts_with("GET http://models.invalid/r/resolve/main/f "),
             "{}",
-            heads[0]
+            heads[1]
         );
         assert_eq!(std::fs::read(&part).unwrap(), b"12345");
     }

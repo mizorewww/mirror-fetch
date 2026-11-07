@@ -2,12 +2,14 @@
 name = "model-fetch"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock, for one download per destination.
+rust-version = "1.89"
 license = "MIT"
-description = "Resumable, verified downloads of model files from Hugging Face and its mirrors"
+description = "Resumable, verified downloads from ordered mirrors, with a Hugging Face layer and a CLI"
 repository = "https://github.com/mizorewww/model-fetch"
 readme = "README.md"
-keywords = ["huggingface", "download", "resume", "aria2", "models"]
-categories = ["network-programming"]
+keywords = ["download", "resume", "mirror", "huggingface", "aria2"]
+categories = ["network-programming", "command-line-utilities"]
 # Consumed as a git dependency; see README.
 publish = false
 
@@ -15,14 +17,25 @@ publish = false
 # `lookup_country`: asks public services for this machine's country. Off by default,
 # and nothing calls it on its own.
 ip-lookup = []
+# The `model-fetch` program. Its dependencies are optional, so the library alone
+# never pulls them in.
+cli = ["dep:clap", "dep:ctrlc"]
 
 [dependencies]
+clap = { version = "4", optional = true, default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+ctrlc = { version = "3", optional = true }
 getrandom = "0.4"
 serde_json = "1"
+sha1 = "0.11"
 sha2 = "0.11"
 tempfile = "3"
 ureq = "3"
 url = "2"
+
+[[bin]]
+name = "model-fetch"
+path = "src/bin/model-fetch/main.rs"
+required-features = ["cli"]
 
 [package.metadata.docs.rs]
 all-features = true

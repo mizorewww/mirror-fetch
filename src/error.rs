@@ -125,6 +125,9 @@ impl From<std::io::Error> for Failure {
 pub(crate) enum Stop {
     Cancelled,
     Failed(Failure),
+    /// A failure that retrying on the same host cannot fix; the built-in client
+    /// turns it into `Failed` before it leaves.
+    Final(Failure),
     /// aria2 could not run at all, as opposed to failing a transfer.
     Aria2Unavailable(String),
 }
