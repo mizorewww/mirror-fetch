@@ -39,3 +39,8 @@ pub use hub::{
     Endpoints, Host, HubFile, MIRROR, ORIGIN, Reason, host_name, local_country, normalize_endpoint,
     system_time_zone,
 };
+
+/// Compiles the README's examples.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
