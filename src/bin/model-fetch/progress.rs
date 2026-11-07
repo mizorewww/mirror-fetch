@@ -4,7 +4,19 @@
 use model_fetch::{Event, Phase, Progress};
 use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// The bytes the current download has confirmed, for the message after Ctrl-C.
+static KEPT: AtomicU64 = AtomicU64::new(0);
+
+pub fn kept() -> u64 {
+    KEPT.load(Ordering::Relaxed)
+}
+
+pub fn reset_kept() {
+    KEPT.store(0, Ordering::Relaxed);
+}
 
 /// How often the terminal line is redrawn.
 const REDRAW: Duration = Duration::from_millis(100);
@@ -13,6 +25,8 @@ pub struct Printer {
     label: String,
     tty: bool,
     quiet: bool,
+    /// How many mirrors will be tried: after the last fails there is no next.
+    mirrors: usize,
     state: Mutex<State>,
 }
 
@@ -25,6 +39,9 @@ struct State {
     base: u64,
     started: Instant,
     drawn: Option<Instant>,
+    /// Bytes on disk from before, said once the connection starts.
+    resumed: Option<u64>,
+    failed_mirrors: usize,
 }
 
 impl Printer {
@@ -33,6 +50,7 @@ impl Printer {
             label: label.to_owned(),
             tty: std::io::stderr().is_terminal(),
             quiet,
+            mirrors: 0,
             state: Mutex::new(State {
                 phase: None,
                 host: String::new(),
@@ -41,6 +59,8 @@ impl Printer {
                 base: 0,
                 started: Instant::now(),
                 drawn: None,
+                resumed: None,
+                failed_mirrors: 0,
             }),
         }
     }
@@ -54,12 +74,9 @@ impl Printer {
         }
     }
 
-    /// Says that `bytes` of an earlier run are kept.
-    pub fn resuming(&self, bytes: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            let message = format!("{}: resuming at {}", self.label, human_bytes(bytes));
-            self.say(&mut state, &message);
-        }
+    pub fn mirrors(mut self, mirrors: usize) -> Self {
+        self.mirrors = mirrors;
+        self
     }
 
     /// A line of its own above the progress line.
@@ -138,6 +155,14 @@ impl Progress for Printer {
         match event {
             Event::Phase { phase, host } => {
                 state.phase = Some(phase);
+                // Bytes kept from before are announced as a mirror is first
+                // connected; a retry's are covered by "interrupted".
+                if let Some(bytes) = state.resumed.take()
+                    && phase == Phase::Connect
+                {
+                    let message = format!("{}: resuming at {}", self.label, human_bytes(bytes));
+                    self.say(&mut state, &message);
+                }
                 if let Some(host) = host {
                     state.host = host.name();
                 }
@@ -167,13 +192,16 @@ impl Progress for Printer {
                 }
             }
             Event::Resumed { bytes } => {
-                // aria2 also reports here what it fetched before its first answer,
-                // so this is not announced; `resuming` says what was on disk.
                 state.position = bytes;
                 state.base = bytes;
+                state.resumed = (bytes > 0).then_some(bytes);
+                KEPT.store(bytes, Ordering::Relaxed);
             }
             Event::Position { bytes } => {
                 state.position = bytes;
+                if state.phase == Some(Phase::Download) {
+                    KEPT.store(bytes, Ordering::Relaxed);
+                }
                 self.draw(&mut state, false);
             }
             Event::Request { .. } | Event::Completed { .. } => {}
@@ -191,16 +219,25 @@ impl Progress for Printer {
                 self.say(&mut state, &message);
             }
             Event::HostFailed { host, failure } => {
-                let message = format!(
-                    "{}: {} failed ({failure}); trying the next mirror",
-                    self.label,
-                    host.name()
-                );
-                self.say(&mut state, &message);
+                state.failed_mirrors += 1;
+                // After the last, the error lists every mirror's failure.
+                if state.failed_mirrors < self.mirrors {
+                    let message = format!(
+                        "{}: {} failed ({failure}); trying the next mirror",
+                        self.label,
+                        host.name()
+                    );
+                    self.say(&mut state, &message);
+                }
             }
             Event::ChecksumMismatch { expected, actual } => {
+                let kind = if expected.len() == 64 {
+                    "sha256"
+                } else {
+                    "git hash"
+                };
                 let message = format!(
-                    "{}: sha256 mismatch: expected {expected}, got {actual}",
+                    "{}: {kind} mismatch: expected {expected}, got {actual}",
                     self.label
                 );
                 self.say(&mut state, &message);

@@ -171,6 +171,77 @@ fn usage_errors_exit_2_and_help_exits_0() {
     assert!(stdout.contains("Exit status"));
 }
 
+/// "trying the next mirror" only when there is one; a stale partial file that
+/// cannot be trusted is not announced as resumed.
+#[test]
+fn messages_say_only_what_happens() {
+    let server = Server::start();
+    server.serve("/a", Body::status(404));
+    server.serve("/b", Body::status(404));
+    let root = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(program().current_dir(root.path()).args([
+        "get",
+        &server.url("/a"),
+        "--mirror",
+        &server.url("/b"),
+        "-o",
+        "f",
+    ]));
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(
+        stderr.matches("trying the next mirror").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("  127.0.0.1: HTTP 404"), "{stderr}");
+
+    server.serve("/c", Body::bytes(b"fresh"));
+    std::fs::write(root.path().join("c.part"), b"stale").unwrap();
+    let (code, _, stderr) =
+        run(program()
+            .current_dir(root.path())
+            .args(["get", &server.url("/c"), "-o", "c"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("resuming"), "{stderr}");
+    assert!(stderr.contains("saved c (5 B, unverified)"), "{stderr}");
+    assert_eq!(std::fs::read(root.path().join("c")).unwrap(), b"fresh");
+}
+
+/// With stdout and stderr closed at the far end, writes fail with EPIPE; the
+/// program carries on and exits by its own result instead of panicking.
+#[test]
+fn a_closed_stdout_or_stderr_is_not_a_panic() {
+    let server = Server::start();
+    server.serve("/f", Body::bytes(b"data"));
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("f");
+    for args in [
+        vec![
+            "get".to_owned(),
+            server.url("/f"),
+            "-o".into(),
+            arg(&file).into(),
+        ],
+        vec![
+            "verify".to_owned(),
+            arg(&file).into(),
+            "--sha256".into(),
+            sha256(b"data"),
+        ],
+        vec!["--help".to_owned()],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = program()
+            .args(&args)
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0), "{args:?}");
+    }
+}
+
 /// Every proxy variable names a dead proxy; loopback goes direct anyway.
 #[test]
 fn loopback_ignores_the_environment_proxy() {
@@ -457,6 +528,7 @@ fn interrupt_then_resume(stall: bool) {
         &sha256(&data),
     ]));
     assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stderr.matches("resuming at").count(), 1, "{stderr}");
     assert_eq!(std::fs::read(root.path().join("big.bin")).unwrap(), data);
     assert_eq!(server.requests().last().unwrap().range, Some(kept));
 }

@@ -2,6 +2,23 @@
 //!
 //! Exit codes: 0 done, 1 failed, 2 usage error, 130 cancelled.
 
+/// A line on stderr. A closed stderr (`2>&-`, a pipe whose reader left) is
+/// ignored rather than turned into a panic, as `eprintln!` would.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+/// A line on stdout, likewise.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 mod progress;
 
 use clap::{Args, Parser, Subcommand};
@@ -203,8 +220,31 @@ fn name_from_url(url: &str) -> Option<String> {
         && name != "."
         && name != ".."
         && !name.contains(['/', '\\', '\0'])
-        && !name.chars().any(char::is_control);
+        && !name.chars().any(char::is_control)
+        && (!cfg!(windows) || windows_name(&name));
     safe.then_some(name)
+}
+
+/// Whether Windows can create a file of this name: none of `<>:"|?*`, no
+/// trailing dot or space, and not a device name (`CON`, `nul.txt`, `COM1`).
+fn windows_name(name: &str) -> bool {
+    const DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let upper = stem.to_ascii_uppercase();
+    let numbered = (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.len() == 4
+        && upper.as_bytes()[3].is_ascii_digit();
+    !name.contains(['<', '>', ':', '"', '|', '?', '*'])
+        && !name.ends_with(['.', ' '])
+        && !DEVICES.contains(&upper.as_str())
+        && !numbered
+}
+
+/// Whether `-o` names a directory: one that exists, or a path ending in a
+/// separator (`/`, and on Windows `\\` too).
+fn names_directory(output: &Path, windows: bool) -> bool {
+    let text = output.as_os_str().to_string_lossy();
+    output.is_dir() || text.ends_with('/') || (windows && text.ends_with('\\'))
 }
 
 fn percent_decode(text: &str) -> Option<String> {
@@ -234,11 +274,11 @@ impl Cancel for CtrlC {
 }
 
 fn error(message: impl std::fmt::Display) {
-    eprintln!("model-fetch: error: {message}");
+    say!("model-fetch: error: {message}");
 }
 
 fn usage(message: impl std::fmt::Display) -> Outcome {
-    eprintln!("model-fetch: usage error: {message}");
+    say!("model-fetch: usage error: {message}");
     Outcome::Usage
 }
 
@@ -318,7 +358,7 @@ fn downloader(transfer: &Transfer) -> Downloader {
         Some("auto") => {
             let found = find_on_path("aria2c");
             if found.is_none() && !transfer.quiet {
-                eprintln!("model-fetch: aria2c not found on PATH; using the built-in client");
+                say!("model-fetch: aria2c not found on PATH; using the built-in client");
             }
             found
         }
@@ -333,12 +373,10 @@ fn downloader(transfer: &Transfer) -> Downloader {
 
 fn run_get(get: Get) -> Outcome {
     let dest = match &get.output {
-        Some(output) if output.is_dir() || output.as_os_str().to_string_lossy().ends_with('/') => {
-            match name_from_url(&get.url) {
-                Some(name) => output.join(name),
-                None => return usage("cannot name the file from its URL; pass -o FILE"),
-            }
-        }
+        Some(output) if names_directory(output, cfg!(windows)) => match name_from_url(&get.url) {
+            Some(name) => output.join(name),
+            None => return usage("cannot name the file from its URL; pass -o FILE"),
+        },
         Some(output) => output.clone(),
         None => match name_from_url(&get.url) {
             Some(name) => PathBuf::from(name),
@@ -419,7 +457,7 @@ fn run_hf(hf: Hf) -> Outcome {
                             .join("; "),
                         other => other.to_string(),
                     };
-                    eprintln!(
+                    say!(
                         "{}: the Hub gave no size or hash ({why}); the download will be unverified",
                         file.file
                     );
@@ -458,7 +496,7 @@ fn run_verify(verify: Verify) -> Outcome {
     printer.finish();
     match result {
         Ok(actual) if actual == verify.sha256 => {
-            println!("{label}: OK");
+            out!("{label}: OK");
             Outcome::Done
         }
         Ok(actual) => {
@@ -469,7 +507,7 @@ fn run_verify(verify: Verify) -> Outcome {
             Outcome::Failed
         }
         Err(Error::Cancelled) => {
-            eprintln!("model-fetch: cancelled");
+            say!("model-fetch: cancelled");
             Outcome::Cancelled
         }
         Err(Error::Io(reason)) => {
@@ -483,15 +521,25 @@ fn run_verify(verify: Verify) -> Outcome {
     }
 }
 
+/// What was kept: the bytes the download had confirmed (aria2 writes pieces
+/// out of order, so the file's length can say more), else the file's length.
 fn report_cancelled(part: Option<&Path>) {
-    let kept = part.and_then(|part| Some((part, std::fs::metadata(part).ok()?.len())));
+    let kept = part.and_then(|part| {
+        let confirmed = progress::kept();
+        let bytes = if confirmed > 0 {
+            confirmed
+        } else {
+            std::fs::metadata(part).ok()?.len()
+        };
+        part.exists().then_some((part, bytes))
+    });
     match kept {
-        Some((part, bytes)) if bytes > 0 => eprintln!(
+        Some((part, bytes)) if bytes > 0 => say!(
             "model-fetch: cancelled; {} kept in {}; run the same command to resume",
             human_bytes(bytes),
             part.display()
         ),
-        _ => eprintln!("model-fetch: cancelled"),
+        _ => say!("model-fetch: cancelled"),
     }
 }
 
@@ -520,7 +568,7 @@ fn download(downloader: &Downloader, target: &Target, dest: &Path, quiet: bool) 
             Ok(true) => {
                 printer.finish();
                 if !quiet {
-                    eprintln!("{}: already complete ({})", dest.display(), checked(target));
+                    say!("{}: already complete ({})", dest.display(), checked(target));
                 }
                 return Outcome::Done;
             }
@@ -536,18 +584,15 @@ fn download(downloader: &Downloader, target: &Target, dest: &Path, quiet: bool) 
     if let Ok(mut current) = CURRENT_PART.lock() {
         *current = Some(part.clone());
     }
-    if let Ok(metadata) = std::fs::metadata(&part)
-        && metadata.len() > 0
-    {
-        printer.resuming(metadata.len());
-    }
+    progress::reset_kept();
+    let printer = printer.mirrors(target.mirrors.len());
     let result = downloader.download(target, dest, &CtrlC, &printer);
     printer.finish();
     match result {
         Ok(()) => {
             if !quiet {
                 let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-                eprintln!(
+                say!(
                     "saved {} ({}, {})",
                     dest.display(),
                     human_bytes(size),
@@ -596,6 +641,28 @@ mod tests {
         ] {
             assert_eq!(name_from_url(url), None, "{url}");
         }
+    }
+
+    #[test]
+    fn windows_names_are_checked() {
+        for good in [
+            "model.gguf",
+            "config.json",
+            "CONFIG",
+            "com10.txt",
+            "a b.bin",
+        ] {
+            assert!(windows_name(good), "{good}");
+        }
+        for bad in [
+            "a:b", "CON", "nul.txt", "Com1", "lpt9.bin", "x?", "trail.", "trail ",
+        ] {
+            assert!(!windows_name(bad), "{bad}");
+        }
+        assert!(names_directory(Path::new("out\\"), true));
+        assert!(!names_directory(Path::new("out\\"), false));
+        assert!(names_directory(Path::new("out/"), false));
+        assert!(!names_directory(Path::new("no-such-file"), true));
     }
 
     #[test]
