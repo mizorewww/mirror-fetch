@@ -120,3 +120,52 @@ fn host_selection_is_unchanged() {
     );
     let _ = system_time_zone();
 }
+
+/// `Downloader::fetch` as course2md calls it.
+type Fetch = for<'a> fn(
+    &Downloader,
+    &Remote<'a>,
+    &std::path::Path,
+    &dyn Cancel,
+    &dyn Progress,
+) -> Result<(), Error>;
+
+/// The signatures course2md calls, as function pointers: a changed parameter
+/// type fails here, not in course2md.
+#[test]
+fn signatures_are_pinned() {
+    use std::path::PathBuf;
+    let _: fn(Vec<Host>, Option<PathBuf>) -> Downloader = Downloader::new;
+    let _: fn(Option<String>, Option<&'static str>) -> Endpoints = Endpoints::choose;
+    let _: fn(&Endpoints) -> Option<&'static str> = Endpoints::hub_override;
+    let _: fn(Option<&str>, Option<&str>) -> Option<String> = local_country;
+    let _: fn() -> Option<String> = system_time_zone;
+    let _: fn(Option<String>) -> Option<String> = normalize_endpoint;
+    let _: fn(&Host) -> String = Host::name;
+    let _: Fetch = Downloader::fetch;
+    let configured: Option<String> = None;
+    let aria2: Option<PathBuf> = None;
+    let chosen: Endpoints = Endpoints::choose(configured, None);
+    let _: Vec<Host> = chosen.hosts.clone();
+    let _: Reason = chosen.reason;
+    let _ = Downloader::new(chosen.hosts, aria2);
+    for reason in [Reason::Configured, Reason::MainlandChina, Reason::Default] {
+        match reason {
+            Reason::Configured | Reason::MainlandChina | Reason::Default => {}
+        }
+    }
+}
+
+/// course2md keeps one Downloader in a OnceLock shared across threads.
+#[test]
+fn a_downloader_can_be_shared_across_threads() {
+    fn shared<T: Send + Sync>() {}
+    shared::<Downloader>();
+    shared::<Error>();
+}
+
+#[cfg(feature = "ip-lookup")]
+#[test]
+fn lookup_country_is_pinned() {
+    let _: fn() -> Option<String> = model_fetch::lookup_country;
+}
