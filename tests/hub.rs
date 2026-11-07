@@ -77,7 +77,9 @@ fn a_git_file_is_checked_against_its_blob_hash() {
     let hub = Server::start();
     hub.serve(
         "/org/model/resolve/main/config.json",
-        Body::bytes(&data).with_etag(&format!("\"{}\"", common::git_sha1(&data))),
+        Body::bytes(&data)
+            .with_etag(&format!("\"{}\"", common::git_sha1(&data)))
+            .with_header("X-Repo-Commit", COMMIT),
     );
     let hosts = [Host::Hub(hub.base())];
     let file = HubFile::new("org/model", "config.json");

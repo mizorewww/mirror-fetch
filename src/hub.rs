@@ -241,18 +241,27 @@ impl HubMetadata {
             (value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit()))
                 .then(|| value.to_ascii_lowercase())
         };
+        let commit = text("x-repo-commit").and_then(|commit| hex(commit, 40));
         let linked = text("x-linked-etag").and_then(|tag| hex(tag, 64));
         let (size, sha256, git_sha1) = if linked.is_some() {
             let size = text("x-linked-size").and_then(|size| size.parse().ok());
             (size, linked, None)
         } else if (200..300).contains(&code) {
-            // Not in LFS: the hub answers for the file itself.
-            let size = text("content-length").and_then(|size| size.parse().ok());
-            (size, None, text("etag").and_then(|tag| hex(tag, 40)))
+            // Not in LFS: the hub answers for the file itself. Any server may send
+            // a 40-digit ETag, so it is read as a blob hash only from a hub: one
+            // that names the commit, or Hugging Face itself.
+            let hub = commit.is_some() || host.is_hugging_face();
+            let git_sha1 = text("etag").and_then(|tag| hex(tag, 40)).filter(|_| hub);
+            // A length alone, or an empty one, is not taken as the file's: an error
+            // page or a HEAD answered without a body says it as easily.
+            let size = text("content-length")
+                .and_then(|size| size.parse::<u64>().ok())
+                .filter(|_| hub)
+                .filter(|size| *size > 0 || git_sha1.is_some());
+            (size, None, git_sha1)
         } else {
             (None, None, None)
         };
-        let commit = text("x-repo-commit").and_then(|commit| hex(commit, 40));
         (size.is_some() || sha256.is_some() || git_sha1.is_some()).then(|| Self {
             host: host.clone(),
             size,
@@ -661,6 +670,51 @@ mod tests {
         let url = Host::Url("https://example.org/x?y=1".into());
         assert_eq!(url.file_url_at("a", "b", "c"), "https://example.org/x?y=1");
         assert_eq!(url.name(), "example.org");
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> ureq::http::HeaderMap {
+        let mut map = ureq::http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    /// A 40-digit ETag and a length are believed only from a hub: one naming
+    /// the commit, or Hugging Face itself; an empty length needs the blob hash.
+    #[test]
+    fn metadata_is_believed_only_from_a_hub() {
+        let sha1 = "a".repeat(40);
+        let commit = "c".repeat(40);
+        let plain = Host::Hub("http://127.0.0.1:9".into());
+        let tagged = format!("\"{sha1}\"");
+        let page = headers(&[("etag", &tagged), ("content-length", "5")]);
+        assert_eq!(HubMetadata::from_headers(&plain, 200, &page), None);
+        let hf = Host::Hub(ORIGIN.into());
+        let found = HubMetadata::from_headers(&hf, 200, &page).unwrap();
+        assert_eq!(
+            (found.size, found.git_sha1.as_deref()),
+            (Some(5), Some(sha1.as_str()))
+        );
+        let named = headers(&[
+            ("etag", &tagged),
+            ("content-length", "5"),
+            ("x-repo-commit", &commit),
+        ]);
+        assert!(HubMetadata::from_headers(&plain, 200, &named).is_some());
+        let empty = headers(&[("content-length", "0"), ("x-repo-commit", &commit)]);
+        assert_eq!(HubMetadata::from_headers(&plain, 200, &empty), None);
+        let empty_file = headers(&[
+            ("etag", &tagged),
+            ("content-length", "0"),
+            ("x-repo-commit", &commit),
+        ]);
+        assert_eq!(
+            HubMetadata::from_headers(&plain, 200, &empty_file)
+                .unwrap()
+                .size,
+            Some(0)
+        );
     }
 
     #[test]
