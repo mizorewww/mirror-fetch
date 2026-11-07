@@ -342,6 +342,10 @@ impl Downloader {
     /// or when a SHA-256 will catch a bad join. Without a hash, a partial file
     /// is never carried from one mirror to the next. With one, a joined file
     /// that fails it is fetched once more from byte 0 on the same mirror.
+    ///
+    /// While it runs, `<part>.lock` is held: a second download of the same
+    /// destination fails at once with [`Error::Io`] of kind `WouldBlock`. On a
+    /// file system without locks the download goes ahead without one.
     pub fn download(
         &self,
         target: &Target,
@@ -507,7 +511,8 @@ impl Downloader {
 /// file; the lock file is removed when it is released.
 struct Lock {
     path: PathBuf,
-    _file: fs::File,
+    /// `None` where the file system cannot lock: the download goes ahead unguarded.
+    file: Option<fs::File>,
 }
 
 impl Lock {
@@ -520,21 +525,26 @@ impl Lock {
                 .create(true)
                 .truncate(false)
                 .write(true)
-                .open(&path)?;
-            match file.try_lock() {
+                .open(&path)
+                .map_err(|error| opening(error, part, cfg!(windows)))?;
+            match locking(file.try_lock(), part)? {
                 // A run that just finished may have removed the file this handle
                 // locks; then others would lock a new one, so try again.
-                Ok(()) if is_at(&file, &path) => {
-                    return Ok(Self { path, _file: file });
+                true if is_at(&file, &path) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    });
                 }
-                Ok(()) => continue,
-                Err(fs::TryLockError::WouldBlock) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        format!("another download is writing {}", part.display()),
-                    ));
+                true => continue,
+                // Some network and FUSE file systems have no locks. Refusing to
+                // download there would be worse than the race the lock prevents;
+                // the crate has no event to say so, so it is documented instead.
+                false => {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Ok(Self { path, file: None });
                 }
-                Err(fs::TryLockError::Error(error)) => return Err(error),
             }
         }
         Err(std::io::Error::other(format!(
@@ -547,7 +557,39 @@ impl Lock {
 impl Drop for Lock {
     fn drop(&mut self) {
         // Removed while still held, so no one can lock this file after it is gone.
-        let _ = fs::remove_file(&self.path);
+        if self.file.is_some() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn busy(part: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!("another download is writing {}", part.display()),
+    )
+}
+
+/// Whether the lock is held (true) or cannot exist on this file system (false).
+fn locking(result: Result<(), fs::TryLockError>, part: &Path) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Err(busy(part)),
+        Err(fs::TryLockError::Error(error)) if error.kind() == std::io::ErrorKind::Unsupported => {
+            Ok(false)
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// On Windows, a lock file that its finishing owner has just removed stays
+/// "delete pending" while open, and opening it is denied: another download
+/// still has it.
+fn opening(error: std::io::Error, part: &Path, windows: bool) -> std::io::Error {
+    if windows && error.kind() == std::io::ErrorKind::PermissionDenied {
+        busy(part)
+    } else {
+        error
     }
 }
 
@@ -1019,6 +1061,32 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// No locks on this file system: go ahead. Held elsewhere, or a Windows
+    /// lock file pending deletion: another download is writing.
+    #[test]
+    fn lock_outcomes() {
+        use std::io::ErrorKind;
+        let part = Path::new("f.part");
+        assert!(locking(Ok(()), part).unwrap());
+        let unsupported = fs::TryLockError::Error(ErrorKind::Unsupported.into());
+        assert!(!locking(Err(unsupported), part).unwrap());
+        let held = locking(Err(fs::TryLockError::WouldBlock), part).unwrap_err();
+        assert_eq!(held.kind(), ErrorKind::WouldBlock);
+        let other = fs::TryLockError::Error(ErrorKind::Other.into());
+        assert_eq!(
+            locking(Err(other), part).unwrap_err().kind(),
+            ErrorKind::Other
+        );
+        let denied = || std::io::Error::from(ErrorKind::PermissionDenied);
+        let pending = opening(denied(), part, true);
+        assert_eq!(pending.kind(), ErrorKind::WouldBlock);
+        assert!(pending.to_string().contains("another download is writing"));
+        assert_eq!(
+            opening(denied(), part, false).kind(),
+            ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

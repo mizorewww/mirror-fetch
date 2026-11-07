@@ -14,7 +14,8 @@ and your own endpoint.
   replace anything. Both are optional. With a hash, a resumed file that fails it is
   fetched once more from the start.
 - **One at a time**: a lock beside the `.part` file makes a second download of the
-  same destination fail at once instead of interleaving bytes.
+  same destination fail at once instead of interleaving bytes. On a file system
+  without locks (some network mounts) it goes ahead without one.
 - **Falls through**: each mirror is tried in order. A missing file, a stalled
   server (no data for a minute) or bytes with the wrong hash move on to the next.
 - **Uses aria2 if you say so**: pass its path for several connections per server;
