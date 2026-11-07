@@ -390,20 +390,16 @@ impl Downloader {
                 route: &self.route,
             };
             let failure = match self.transfer(&transfer) {
-                Ok(()) => match verify(part, expect, cancel, progress) {
-                    Ok(true) => {
+                Ok(()) => match check(part, expect, cancel, progress) {
+                    Ok(None) => {
                         fs::rename(part, dest).map_err(Error::Io)?;
                         placed();
                         progress.event(Event::Completed { host });
                         return Ok(());
                     }
-                    Ok(false) => {
+                    Ok(Some(failure)) => {
                         let _ = fs::remove_file(part);
-                        failures.push(HostFailure {
-                            host: host.name(),
-                            failure: Failure::ChecksumMismatch,
-                        });
-                        continue;
+                        failure
                     }
                     Err(Stop::Failed(Failure::Io(error))) => return Err(Error::Io(error)),
                     Err(_) => return Err(Error::Cancelled),
@@ -505,31 +501,46 @@ fn hash_file(path: &Path, cancel: &dyn Cancel, progress: &dyn Progress) -> Resul
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Whether `part` has the expected size and SHA-256, where they are known;
-/// reports hashing progress.
+/// Whether `part` has the expected size and SHA-256, where they are known.
+#[cfg(test)]
 pub(crate) fn verify(
     part: &Path,
     expect: Expect<'_>,
     cancel: &dyn Cancel,
     progress: &dyn Progress,
 ) -> Result<bool, Stop> {
-    if let Some(size) = expect.size
-        && fs::metadata(part).map(|m| m.len()).unwrap_or(0) != size
-    {
-        return Ok(false);
+    check(part, expect, cancel, progress).map(|failure| failure.is_none())
+}
+
+/// What is wrong with `part`, if anything: its size, then its SHA-256, where they
+/// are known. Reports hashing progress.
+pub(crate) fn check(
+    part: &Path,
+    expect: Expect<'_>,
+    cancel: &dyn Cancel,
+    progress: &dyn Progress,
+) -> Result<Option<Failure>, Stop> {
+    if let Some(size) = expect.size {
+        let actual = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+        if actual != size {
+            return Ok(Some(Failure::Incomplete {
+                expected: size,
+                received: actual,
+            }));
+        }
     }
     let Some(expected) = expect.sha256 else {
-        return Ok(true);
+        return Ok(None);
     };
     let digest = hash_file(part, cancel, progress)?;
-    let matches = digest.eq_ignore_ascii_case(expected.trim());
-    if !matches {
-        progress.event(Event::ChecksumMismatch {
-            expected,
-            actual: &digest,
-        });
+    if digest.eq_ignore_ascii_case(expected.trim()) {
+        return Ok(None);
     }
-    Ok(matches)
+    progress.event(Event::ChecksumMismatch {
+        expected,
+        actual: &digest,
+    });
+    Ok(Some(Failure::ChecksumMismatch))
 }
 
 /// Records the verified size so a later start can trust the file without hashing it.
@@ -802,6 +813,25 @@ mod tests {
         assert!(!part_path(&dest).exists());
         assert_eq!(part_path(&dest), root.path().join("file.tar.gz.part"));
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    /// A transfer that ends at the wrong length is reported as such, not as a
+    /// checksum mismatch.
+    #[test]
+    fn a_wrong_size_is_reported_as_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("f.part");
+        fs::write(&part, b"1234").unwrap();
+        let expect = Expect {
+            size: Some(5),
+            sha256: Some("00"),
+        };
+        match check(&part, expect, &(), &()).unwrap() {
+            Some(Failure::Incomplete { expected, received }) => {
+                assert_eq!((expected, received), (5, 4));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
