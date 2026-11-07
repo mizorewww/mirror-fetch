@@ -7,8 +7,14 @@ and your own endpoint.
 
 - **Resumes**: a `.part` file keeps what arrived; HTTP ranges or aria2 continue from
   it, in the same run after a dropped connection or in the next run after Ctrl-C.
+  Only bytes known to be the same file are continued: the next run sends the ETag
+  or Last-Modified it started with as `If-Range` (a changed file comes back whole),
+  and without a hash a partial file never passes from one mirror to another.
 - **Verifies**: give a size and a SHA-256 and the bytes must match before they
-  replace anything. Both are optional.
+  replace anything. Both are optional. With a hash, a resumed file that fails it is
+  fetched once more from the start.
+- **One at a time**: a lock beside the `.part` file makes a second download of the
+  same destination fail at once instead of interleaving bytes.
 - **Falls through**: each mirror is tried in order. A missing file, a stalled
   server (no data for a minute) or bytes with the wrong hash move on to the next.
 - **Uses aria2 if you say so**: pass its path for several connections per server;
@@ -63,6 +69,20 @@ Hosts are tried in order: the `--endpoint URL` values if any are given (repeatab
 otherwise `HF_ENDPOINT` if set, then `https://huggingface.co`, then
 `https://hf-mirror.com`. Each file keeps its path under `-o DIR` (default `.`).
 `--aria2`, `--connections` and `--quiet` work as for `get`.
+
+Each file is checked against what the Hub says about it: the SHA-256 and size of a
+file in LFS, the Git blob hash and size of any other. It is downloaded at the commit
+the revision names, so a branch that moves meanwhile cannot mix two versions, and a
+file already there that matches is not downloaded again. If no host gives that
+information, the program says so and the download is unverified.
+
+```text
+model.gguf: connecting to huggingface.co...
+model.gguf: downloading from cas-bridge.xethub.hf.co
+saved models/model.gguf (1.9 GiB, sha256 verified)
+config.json: connecting to huggingface.co...
+saved models/config.json (1.2 KiB, git hash verified)
+```
 
 `HF_TOKEN`, if set, is sent as a bearer token only to `huggingface.co` and `hf.co`
 (and their subdomains) over HTTPS: never to hf-mirror.com or another endpoint, never
@@ -136,8 +156,10 @@ Downloader::default()
 ```
 
 `Target` holds `Mirror`s; `Mirror::new(url).with_bearer(token)` sends a token to
-that one URL only. Without a size, the server's length is trusted; without a hash,
-the bytes are not checked. `Error::AllHostsFailed` lists each mirror's `Failure`;
+that URL's origin only, never past a redirect that leaves it. Without a size, the
+server's length is trusted; without a hash, the bytes are not checked.
+`file_matches` tells whether a finished file is a target's. A second download of the
+same destination while one runs fails with `Error::Io` of kind `WouldBlock`. `Error::AllHostsFailed` lists each mirror's `Failure`;
 `Event`s report phases, retries, failed mirrors and completion. The crate has no
 user-facing text: wording them is the application's job.
 
@@ -152,11 +174,16 @@ let token = std::env::var("HF_TOKEN").ok();
 let file = HubFile::new("org/model", "onnx/model.onnx").at("v1.0");
 // The token goes only to hosts that are Hugging Face itself.
 // A repository, revision or file with a `..` segment is refused.
-let target = file
-    .target(&hosts, token.as_deref())
-    .expect("a plain path")
-    .with_size(1_234_567);
-Downloader::default().download(&target, Path::new("models/model.onnx"), &(), &())?;
+let mirrors = file.mirrors(&hosts, token.as_deref()).expect("a plain path");
+let downloader = Downloader::default();
+// The Hub's size and SHA-256 (or Git blob hash), and the commit to fetch at.
+let metadata = downloader.hub_metadata(&mirrors)?;
+let pinned = match &metadata.commit {
+    Some(commit) => file.at(commit),
+    None => file,
+};
+let target = metadata.apply(pinned.target(&hosts, token.as_deref()).expect("a plain path"));
+downloader.download(&target, Path::new("models/model.onnx"), &(), &())?;
 # Ok::<(), model_fetch::Error>(())
 ```
 
@@ -198,6 +225,8 @@ program chose it.
 The library reads no environment variable of its own beyond the proxy ones. aria2 is
 given the same route in a private config file; it speaks only to HTTP proxies, so
 with a SOCKS or HTTPS proxy the built-in client takes over.
+
+Rust 1.89 or later.
 
 ## License
 
