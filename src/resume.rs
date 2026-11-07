@@ -57,6 +57,19 @@ impl Validator {
         }
     }
 
+    /// Whether `other` shows another version: different ETags, or with no ETag
+    /// on one side, different Last-Modified dates. A validator that cannot be
+    /// compared is no conflict.
+    pub fn conflicts(&self, other: &Self) -> bool {
+        match (&self.etag, &other.etag) {
+            (Some(a), Some(b)) => a != b,
+            _ => match (&self.last_modified, &other.last_modified) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            },
+        }
+    }
+
     pub fn load(part: &Path) -> Option<Self> {
         let text = fs::read_to_string(meta_path(part)).ok()?;
         let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -143,6 +156,9 @@ mod tests {
         let tagged = Validator::from_headers("u", &headers(&[("etag", "\"abc\"")])).unwrap();
         assert_eq!(tagged.if_range(), "\"abc\"");
         assert!(!tagged.same_resource(&dated));
+        let other = Validator::from_headers("u", &headers(&[("etag", "\"def\"")])).unwrap();
+        assert!(tagged.conflicts(&other));
+        assert!(!tagged.conflicts(&dated), "nothing to compare");
         assert!(tagged.same_resource(&tagged.clone()));
     }
 

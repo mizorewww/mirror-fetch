@@ -69,8 +69,7 @@ pub(crate) fn run(t: &Transfer) -> Result<(), Stop> {
         }
         t.progress.event(Event::Resumed { bytes: have });
         t.phase(phase);
-        let if_range = validator.as_ref().map(Validator::if_range);
-        let result = attempt(&agent, t, have, if_range, &mut own);
+        let result = attempt(&agent, t, have, validator.as_ref(), &mut own);
         let after = fs::metadata(t.part).map(|m| m.len()).unwrap_or(0);
         match result {
             Ok(()) => return Ok(()),
@@ -163,7 +162,7 @@ fn attempt(
     agent: &ureq::Agent,
     t: &Transfer,
     have: u64,
-    if_range: Option<&str>,
+    stored: Option<&Validator>,
     own: &mut bool,
 ) -> Result<(), Stop> {
     t.progress.event(Event::Request {
@@ -173,9 +172,9 @@ fn attempt(
     let mut headers = Vec::new();
     if have > 0 {
         headers.push(("Range", format!("bytes={have}-")));
-        if let Some(validator) = if_range {
+        if let Some(validator) = stored {
             // A changed file comes back whole, with 200, instead of as a range.
-            headers.push(("If-Range", validator.to_owned()));
+            headers.push(("If-Range", validator.if_range().to_owned()));
         }
     }
     let mut response = http::send(agent, Method::Get, t.url, &headers, t.bearer, Follow::All)
@@ -212,6 +211,20 @@ fn attempt(
                 format!("asked for bytes from {have}, got a 206 without a usable Content-Range")
             }
         })
+        .into());
+    }
+    if resumed
+        && let (Some(stored), Some(now)) =
+            (stored, Validator::from_headers(t.url, response.headers()))
+        && stored.conflicts(&now)
+    {
+        // The server ignored If-Range and sent a range of another version.
+        resume::discard(t.part);
+        return Err(Failure::Request(format!(
+            "asked to continue {}, got a range of {}",
+            stored.if_range(),
+            now.if_range()
+        ))
         .into());
     }
     let announced = if resumed {

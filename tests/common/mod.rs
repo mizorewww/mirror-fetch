@@ -31,6 +31,8 @@ pub struct Body {
     headers: Vec<(String, String)>,
     /// `HEAD` gets 405.
     no_head: bool,
+    /// Ranges are served whatever `If-Range` says.
+    ignore_if_range: bool,
 }
 
 impl Body {
@@ -83,6 +85,11 @@ impl Body {
 
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub fn ignoring_if_range(mut self) -> Self {
+        self.ignore_if_range = true;
         self
     }
 
@@ -273,7 +280,7 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) {
         return;
     }
     // A range is honoured only for the version the client already has.
-    if if_range.is_some() && if_range != body.etag {
+    if !body.ignore_if_range && if_range.is_some() && if_range != body.etag {
         range = None;
         range_end = None;
     }
