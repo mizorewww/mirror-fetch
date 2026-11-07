@@ -38,8 +38,8 @@ pub use error::{Error, Failure, HostFailure};
 #[cfg(feature = "ip-lookup")]
 pub use hub::lookup_country;
 pub use hub::{
-    Endpoints, Host, HubFile, MIRROR, ORIGIN, Reason, host_name, local_country, normalize_endpoint,
-    system_time_zone,
+    Endpoints, Host, HubFile, InvalidHubPath, MIRROR, ORIGIN, Reason, host_name, local_country,
+    normalize_endpoint, system_time_zone,
 };
 
 /// Compiles the README's examples.

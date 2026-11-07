@@ -20,6 +20,7 @@ fn a_hub_file_falls_through_hubs_at_its_revision() {
     let file = HubFile::new("org/model", "onnx/model.onnx").at("refs/pr/3");
     let target = file
         .target(&hosts, Some("hf_secret"))
+        .unwrap()
         .with_size(data.len() as u64)
         .with_sha256(sha256(data));
     let root = tempfile::tempdir().unwrap();

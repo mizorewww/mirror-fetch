@@ -391,9 +391,13 @@ fn run_hf(hf: Hf) -> Outcome {
     let downloader = downloader(&hf.transfer);
     let mut failed = 0;
     for (file, path) in hf.files.iter().zip(&paths) {
-        let target = HubFile::new(&hf.repo, file)
+        let target = match HubFile::new(&hf.repo, file)
             .at(&hf.revision)
-            .target(&hosts, token.as_deref());
+            .target(&hosts, token.as_deref())
+        {
+            Ok(target) => target,
+            Err(reason) => return usage(reason),
+        };
         match download(
             &downloader,
             &target,

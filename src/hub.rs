@@ -82,7 +82,18 @@ impl Host {
 }
 
 /// Percent-escapes everything but unreserved characters, and `/` when `slashes`.
+/// A `.` or `..` segment is escaped too, so no URL can climb out of its path.
 fn escape(text: &str, slashes: bool) -> String {
+    if slashes {
+        return text
+            .split('/')
+            .map(|segment| escape(segment, false))
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    if text == "." || text == ".." {
+        return text.replace('.', "%2E");
+    }
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
@@ -122,10 +133,39 @@ impl<'a> HubFile<'a> {
         self
     }
 
-    /// One mirror per host, in order. `token` goes only to hosts that
-    /// [`Host::is_hugging_face`]; a third-party mirror never sees it.
-    pub fn mirrors(&self, hosts: &[Host], token: Option<&str>) -> Vec<Mirror> {
-        hosts
+    /// Whether the repository, revision and file are plain paths: no empty, `.`
+    /// or `..` segment, no leading `/`, no `\`. The revision may contain `/`
+    /// (`refs/pr/1`).
+    pub fn validate(&self) -> Result<(), InvalidHubPath> {
+        for (field, value) in [
+            ("repository", self.repo),
+            ("revision", self.revision),
+            ("file", self.file),
+        ] {
+            let plain = !value.contains('\\')
+                && value
+                    .split('/')
+                    .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+            if !plain {
+                return Err(InvalidHubPath {
+                    field,
+                    value: value.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// One mirror per host, in order, once [`HubFile::validate`] passes. `token`
+    /// goes only to hosts that [`Host::is_hugging_face`]; a third-party mirror
+    /// never sees it.
+    pub fn mirrors(
+        &self,
+        hosts: &[Host],
+        token: Option<&str>,
+    ) -> Result<Vec<Mirror>, InvalidHubPath> {
+        self.validate()?;
+        Ok(hosts
             .iter()
             .map(|host| {
                 let mirror = Mirror::on(
@@ -137,17 +177,37 @@ impl<'a> HubFile<'a> {
                     _ => mirror,
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// [`HubFile::mirrors`] as a [`Target`], without size or hash.
-    pub fn target(&self, hosts: &[Host], token: Option<&str>) -> Target {
-        Target {
-            mirrors: self.mirrors(hosts, token),
+    pub fn target(&self, hosts: &[Host], token: Option<&str>) -> Result<Target, InvalidHubPath> {
+        Ok(Target {
+            mirrors: self.mirrors(hosts, token)?,
             ..Target::default()
-        }
+        })
     }
 }
+
+/// A [`HubFile`] part that could reach outside its repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidHubPath {
+    /// `repository`, `revision` or `file`.
+    pub field: &'static str,
+    pub value: String,
+}
+
+impl std::fmt::Display for InvalidHubPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the {} '{}' has an empty, '.' or '..' segment or a backslash",
+            self.field, self.value
+        )
+    }
+}
+
+impl std::error::Error for InvalidHubPath {}
 
 /// Why [`Endpoints`] has its order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +543,30 @@ mod tests {
     }
 
     #[test]
+    fn hub_paths_cannot_climb_out() {
+        let hosts = [Host::Hub(ORIGIN.into())];
+        for (repo, revision, file) in [
+            ("org/repo", "main", "../other/x"),
+            ("org/repo", "main", "a/./b"),
+            ("org/repo", "main", "/abs"),
+            ("org/repo", "main", "a\\b"),
+            ("org/repo", "..", "a"),
+            ("org/repo", "refs/../x", "a"),
+            ("org/..", "main", "a"),
+            ("", "main", "a"),
+        ] {
+            let file = HubFile::new(repo, file).at(revision);
+            assert!(file.target(&hosts, None).is_err(), "{file:?}");
+        }
+        assert!(HubFile::new("gpt2", "config.json").validate().is_ok());
+        // Even a URL built directly keeps dot segments as data.
+        assert_eq!(
+            Host::Hub(ORIGIN.into()).file_url_at("org/repo", "..", "../x"),
+            "https://huggingface.co/org/repo/resolve/%2E%2E/%2E%2E/x"
+        );
+    }
+
+    #[test]
     fn only_hugging_face_over_https_counts_as_hugging_face() {
         for base in [
             ORIGIN,
@@ -509,7 +593,7 @@ mod tests {
     fn a_hub_file_gives_its_token_only_to_hugging_face() {
         let hosts = [Host::Hub(MIRROR.into()), Host::Hub(ORIGIN.into())];
         let file = HubFile::new("org/repo", "a.gguf").at("v2");
-        let mirrors = file.mirrors(&hosts, Some("hf_secret"));
+        let mirrors = file.mirrors(&hosts, Some("hf_secret")).unwrap();
         assert_eq!(
             mirrors[0].url(),
             "https://hf-mirror.com/org/repo/resolve/v2/a.gguf"
@@ -518,7 +602,7 @@ mod tests {
         assert!(mirrors[1].has_bearer());
         assert_eq!(mirrors[1].host(), &hosts[1]);
         assert!(!format!("{mirrors:?}").contains("hf_secret"));
-        let target = file.target(&hosts, None);
+        let target = file.target(&hosts, None).unwrap();
         assert!(target.mirrors.iter().all(|mirror| !mirror.has_bearer()));
         assert_eq!((target.size, target.sha256), (None, None));
     }

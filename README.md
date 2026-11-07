@@ -151,7 +151,11 @@ let hosts = [Host::Hub(ORIGIN.into()), Host::Hub(MIRROR.into())];
 let token = std::env::var("HF_TOKEN").ok();
 let file = HubFile::new("org/model", "onnx/model.onnx").at("v1.0");
 // The token goes only to hosts that are Hugging Face itself.
-let target = file.target(&hosts, token.as_deref()).with_size(1_234_567);
+// A repository, revision or file with a `..` segment is refused.
+let target = file
+    .target(&hosts, token.as_deref())
+    .expect("a plain path")
+    .with_size(1_234_567);
 Downloader::default().download(&target, Path::new("models/model.onnx"), &(), &())?;
 # Ok::<(), model_fetch::Error>(())
 ```
