@@ -5,15 +5,16 @@ edition = "2024"
 # File::try_lock, for one download per destination.
 rust-version = "1.89"
 license = "MIT"
-description = "Resumable, verified downloads from ordered mirrors, with a Hugging Face layer and a CLI"
+description = "Resumable, verified downloads from ordered mirrors, with a Hugging Face layer and an optional CLI"
 repository = "https://github.com/mizorewww/mirror-fetch"
 homepage = "https://github.com/mizorewww/mirror-fetch"
 documentation = "https://docs.rs/mirror-fetch"
 readme = "README.md"
 keywords = ["download", "resume", "mirror", "huggingface", "aria2"]
-categories = ["network-programming", "command-line-utilities"]
-# Consumed as a git dependency; see README.
-publish = false
+categories = ["network-programming", "command-line-utilities", "web-programming::http-client"]
+# What the package ships: the code, its tests (with their loopback server), the
+# README, the licence and the lock file for `cargo install --locked`.
+include = ["/src/**", "/tests/**", "/README.md", "/LICENSE", "/Cargo.lock"]
 
 [features]
 # `lookup_country`: asks public services for this machine's country. Off by default,

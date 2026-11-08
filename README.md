@@ -32,7 +32,7 @@ renamed when it grew beyond model files.
 ## Command line
 
 ```sh
-cargo install --git https://github.com/mizorewww/mirror-fetch --features cli
+cargo install mirror-fetch --features cli --locked
 ```
 
 ### `get`: any URL
@@ -116,10 +116,8 @@ command again to resume. A second Ctrl-C leaves at once.
 
 ```toml
 [dependencies]
-mirror-fetch = { git = "https://github.com/mizorewww/mirror-fetch" }
+mirror-fetch = "0.1"
 ```
-
-Not on crates.io; pin a Git revision with `rev = "..."`.
 
 ### Any URL
 
