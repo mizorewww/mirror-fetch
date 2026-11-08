@@ -197,7 +197,7 @@ pub(crate) fn run(program: &Path, t: &Transfer) -> Result<(), Stop> {
             all.extend(rest);
         }
         let request =
-            serde_json::json!({"jsonrpc":"2.0","id":"model-fetch","method":method,"params":all});
+            serde_json::json!({"jsonrpc":"2.0","id":"mirror-fetch","method":method,"params":all});
         let body = rpc
             .post(&endpoint)
             .content_type("application/json")

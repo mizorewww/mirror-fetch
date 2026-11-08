@@ -1,4 +1,4 @@
-//! `model-fetch`: resumable, verified downloads from the command line.
+//! `mirror-fetch`: resumable, verified downloads from the command line.
 //!
 //! Exit codes: 0 done, 1 failed, 2 usage error, 130 cancelled.
 
@@ -22,7 +22,7 @@ macro_rules! out {
 mod progress;
 
 use clap::{Args, Parser, Subcommand};
-use model_fetch::{
+use mirror_fetch::{
     Cancel, Downloader, Error, Host, HubFile, MIRROR, ORIGIN, Target, file_matches, file_sha256,
     normalize_endpoint, part_path,
 };
@@ -46,7 +46,7 @@ const GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Parser)]
 #[command(
-    name = "model-fetch",
+    name = "mirror-fetch",
     version,
     about = "Resumable, verified downloads from ordered mirrors",
     long_about = "Resumable, verified downloads from ordered mirrors.\n\n\
@@ -274,11 +274,11 @@ impl Cancel for CtrlC {
 }
 
 fn error(message: impl std::fmt::Display) {
-    say!("model-fetch: error: {message}");
+    say!("mirror-fetch: error: {message}");
 }
 
 fn usage(message: impl std::fmt::Display) -> Outcome {
-    say!("model-fetch: usage error: {message}");
+    say!("mirror-fetch: usage error: {message}");
     Outcome::Usage
 }
 
@@ -358,7 +358,7 @@ fn downloader(transfer: &Transfer) -> Downloader {
         Some("auto") => {
             let found = find_on_path("aria2c");
             if found.is_none() && !transfer.quiet {
-                say!("model-fetch: aria2c not found on PATH; using the built-in client");
+                say!("mirror-fetch: aria2c not found on PATH; using the built-in client");
             }
             found
         }
@@ -501,7 +501,7 @@ fn run_verify(verify: Verify) -> Outcome {
             Outcome::Failed
         }
         Err(Error::Cancelled) => {
-            say!("model-fetch: cancelled");
+            say!("mirror-fetch: cancelled");
             Outcome::Cancelled
         }
         Err(Error::Io(reason)) => {
@@ -529,11 +529,11 @@ fn report_cancelled(part: Option<&Path>) {
     });
     match kept {
         Some((part, bytes)) if bytes > 0 => say!(
-            "model-fetch: cancelled; {} kept in {}; run the same command to resume",
+            "mirror-fetch: cancelled; {} kept in {}; run the same command to resume",
             human_bytes(bytes),
             part.display()
         ),
-        _ => say!("model-fetch: cancelled"),
+        _ => say!("mirror-fetch: cancelled"),
     }
 }
 

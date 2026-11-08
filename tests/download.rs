@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Body, Server, payload, sha256};
-use model_fetch::{Downloader, Error, Event, Failure, Mirror, Progress, Target, part_path};
+use mirror_fetch::{Downloader, Error, Event, Failure, Mirror, Progress, Target, part_path};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;

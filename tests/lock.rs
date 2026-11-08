@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Body, Server, payload, sha256};
-use model_fetch::{Downloader, Error, Host, Remote, Target, part_path};
+use mirror_fetch::{Downloader, Error, Host, Remote, Target, part_path};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

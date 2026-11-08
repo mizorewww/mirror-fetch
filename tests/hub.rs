@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Body, Server, sha256};
-use model_fetch::{Downloader, Host, HubFile};
+use mirror_fetch::{Downloader, Host, HubFile};
 
 /// The first hub lacks the revision; the second has it. A token is not given to
 /// either, because neither is Hugging Face.
