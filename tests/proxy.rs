@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Body, Server, sha256};
-use model_fetch::{Downloader, Target};
+use mirror_fetch::{Downloader, Target};
 
 /// With every proxy variable pointing at nothing, a loopback mirror is still
 /// reached directly.

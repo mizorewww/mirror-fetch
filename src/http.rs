@@ -4,7 +4,7 @@
 use crate::proxy::Route;
 use std::time::Duration;
 
-pub(crate) const USER_AGENT: &str = concat!("model-fetch/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("mirror-fetch/", env!("CARGO_PKG_VERSION"));
 
 /// Hosts hand large files to a CDN; this many hops are followed.
 const MAX_REDIRECTS: usize = 5;

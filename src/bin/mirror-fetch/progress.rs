@@ -1,7 +1,7 @@
 //! Progress on stderr: one line redrawn in place on a terminal, plain lines for
 //! each step otherwise.
 
-use model_fetch::{Event, Phase, Progress};
+use mirror_fetch::{Event, Phase, Progress};
 use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,9 +1,12 @@
-# model-fetch
+# mirror-fetch
 
 Resumable, verified downloads of any HTTP(S) file from an ordered list of mirrors,
 as a Rust library and a small command-line tool. A thin Hugging Face layer turns a
 repository, revision and file into mirror URLs across huggingface.co, hf-mirror.com
 and your own endpoint.
+
+Formerly `model-fetch`: the crate, its library (`model_fetch`) and its program were
+renamed when it grew beyond model files.
 
 - **Resumes**: a `.part` file keeps what arrived; HTTP ranges or aria2 continue from
   it, in the same run after a dropped connection or in the next run after Ctrl-C.
@@ -29,13 +32,13 @@ and your own endpoint.
 ## Command line
 
 ```sh
-cargo install --git https://github.com/mizorewww/model-fetch --features cli
+cargo install mirror-fetch --features cli --locked
 ```
 
 ### `get`: any URL
 
 ```sh
-model-fetch get https://example.org/files/model.gguf \
+mirror-fetch get https://example.org/files/model.gguf \
     --mirror https://mirror.example.net/model.gguf \
     --sha256 b2ad8199aa54564790f81ff19f9736e0f6fa5fe928a66dbfab00f1756e3efb11
 ```
@@ -62,8 +65,8 @@ saved model.gguf (2.9 MiB, sha256 verified)
 ### `hf`: files from a Hugging Face repository
 
 ```sh
-model-fetch hf ggml-org/Qwen3-ASR-1.7B-GGUF Qwen3-ASR-1.7B-Q8_0.gguf -o models
-model-fetch hf org/model config.json onnx/model.onnx --revision v1.0 -o models
+mirror-fetch hf ggml-org/Qwen3-ASR-1.7B-GGUF Qwen3-ASR-1.7B-Q8_0.gguf -o models
+mirror-fetch hf org/model config.json onnx/model.onnx --revision v1.0 -o models
 ```
 
 Hosts are tried in order: the `--endpoint URL` values if any are given (repeatable);
@@ -93,7 +96,7 @@ client), and never printed.
 ### `verify`
 
 ```sh
-model-fetch verify models/model.gguf --sha256 b2ad8199aa54564790f81ff19f9736e0f6fa5fe928a66dbfab00f1756e3efb11
+mirror-fetch verify models/model.gguf --sha256 b2ad8199aa54564790f81ff19f9736e0f6fa5fe928a66dbfab00f1756e3efb11
 ```
 
 ### Behaviour
@@ -113,15 +116,13 @@ command again to resume. A second Ctrl-C leaves at once.
 
 ```toml
 [dependencies]
-model-fetch = { git = "https://github.com/mizorewww/model-fetch" }
+mirror-fetch = "0.1"
 ```
-
-Not on crates.io; pin a Git revision with `rev = "..."`.
 
 ### Any URL
 
 ```rust,no_run
-use model_fetch::{Downloader, Event, Progress, Target};
+use mirror_fetch::{Downloader, Event, Progress, Target};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
@@ -153,7 +154,7 @@ Downloader::default()
     .with_aria2(Some("aria2c".into()))
     .with_connections(8)
     .download(&target, Path::new("data/data.tar.zst"), &cancel, &Print)?;
-# Ok::<(), model_fetch::Error>(())
+# Ok::<(), mirror_fetch::Error>(())
 ```
 
 `Target` holds `Mirror`s; `Mirror::new(url).with_bearer(token)` sends a token to
@@ -167,7 +168,7 @@ user-facing text: wording them is the application's job.
 ### Hugging Face
 
 ```rust,no_run
-use model_fetch::{Downloader, Host, HubFile, MIRROR, ORIGIN};
+use mirror_fetch::{Downloader, Host, HubFile, MIRROR, ORIGIN};
 use std::path::Path;
 
 let hosts = [Host::Hub(ORIGIN.into()), Host::Hub(MIRROR.into())];
@@ -184,7 +185,7 @@ let target = metadata
     .target(&file, &hosts, token.as_deref())
     .expect("a plain path");
 downloader.download(&target, Path::new("models/model.onnx"), &(), &())?;
-# Ok::<(), model_fetch::Error>(())
+# Ok::<(), mirror_fetch::Error>(())
 ```
 
 `Downloader::fetch` keeps the original model-file API: a `Remote` with its
@@ -192,7 +193,7 @@ published size and SHA-256, tried across the downloader's own hosts at `main`, w
 `model.part` beside the file and `model.manifest.json` written after it.
 
 ```rust,no_run
-use model_fetch::{Downloader, Endpoints, Remote};
+use mirror_fetch::{Downloader, Endpoints, Remote};
 use std::path::Path;
 
 let remote = Remote {
@@ -203,7 +204,7 @@ let remote = Remote {
 };
 let hosts = Endpoints::choose(std::env::var("HF_ENDPOINT").ok(), None).hosts;
 Downloader::new(hosts, None).fetch(&remote, Path::new("models/model.gguf"), &(), &())?;
-# Ok::<(), model_fetch::Error>(())
+# Ok::<(), mirror_fetch::Error>(())
 ```
 
 ### Choosing hosts

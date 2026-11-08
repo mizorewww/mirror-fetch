@@ -1,7 +1,7 @@
 //! The API as course2md uses it, pinned: exhaustive matches, struct literals and
 //! constructors that must keep compiling as the crate grows.
 
-use model_fetch::{
+use mirror_fetch::{
     Cancel, Downloader, Endpoints, Error, Event, Failure, Host, MIRROR, ORIGIN, Phase, Progress,
     Reason, Remote, local_country, normalize_endpoint, system_time_zone,
 };
@@ -167,5 +167,5 @@ fn a_downloader_can_be_shared_across_threads() {
 #[cfg(feature = "ip-lookup")]
 #[test]
 fn lookup_country_is_pinned() {
-    let _: fn() -> Option<String> = model_fetch::lookup_country;
+    let _: fn() -> Option<String> = mirror_fetch::lookup_country;
 }

@@ -1,4 +1,4 @@
-//! The `model-fetch` program end to end, against a loopback server.
+//! The `mirror-fetch` program end to end, against a loopback server.
 
 #![cfg(feature = "cli")]
 
@@ -11,7 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn program() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_model-fetch"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mirror-fetch"));
     for name in [
         "ALL_PROXY",
         "HTTPS_PROXY",
@@ -148,7 +148,7 @@ fn get_skips_a_mirror_with_the_wrong_bytes_and_fails_when_none_match() {
     assert_eq!(code, 1, "{stderr}");
     assert!(
         stderr.contains(
-            "model-fetch: error: could not download g.bin\n  127.0.0.1: checksum mismatch"
+            "mirror-fetch: error: could not download g.bin\n  127.0.0.1: checksum mismatch"
         ),
         "{stderr}"
     );

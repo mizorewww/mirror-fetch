@@ -5,7 +5,7 @@
 mod common;
 
 use common::{Body, Server, payload, sha256};
-use model_fetch::{Downloader, Event, Progress, Target, part_path};
+use mirror_fetch::{Downloader, Event, Progress, Target, part_path};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

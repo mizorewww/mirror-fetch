@@ -1,5 +1,5 @@
-# Versions, changelog and Git tags only. Nothing goes to crates.io: `publish = false`
-# stands in Cargo.toml until the owner decides otherwise.
+# Versions, changelog and Git tags only. Publishing to crates.io is a manual
+# `cargo publish` for now, so release-plz does not publish.
 [workspace]
 git_only = true
 publish = false

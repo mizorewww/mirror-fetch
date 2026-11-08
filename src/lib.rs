@@ -18,7 +18,7 @@
 //! environment variable of its own beyond the standard proxy ones (`ALL_PROXY`,
 //! `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`), which it follows for every host but
 //! loopback, and has no user-facing text: it returns typed [`Event`]s and [`Error`]s
-//! for the application to word. The `cli` feature builds the `model-fetch` program,
+//! for the application to word. The `cli` feature builds the `mirror-fetch` program,
 //! which does word them.
 
 mod aria2;

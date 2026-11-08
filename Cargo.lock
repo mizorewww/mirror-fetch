@@ -435,7 +435,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "model-fetch"
+name = "mirror-fetch"
 version = "0.1.0"
 dependencies = [
  "clap",
